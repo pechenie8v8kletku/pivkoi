@@ -1,0 +1,164 @@
+import hashlib
+
+import pytest
+from fastapi.testclient import TestClient
+
+from business_match.app import create_app
+from business_match.config import Settings
+from business_match.providers import normalize
+from business_match.ranking import FeatureBuilder, create_ranker
+from business_match.schemas import BusinessProfile, Document, Need
+from business_match.storage import clients, ranker_states, slates
+
+
+class FakeProviders:
+    def __init__(self):
+        self.profile_calls = 0
+
+    async def profile(self, source):
+        self.profile_calls += 1
+        return BusinessProfile(summary=source.description or source.name,
+                               offers=[source.description or source.name],
+                               needs=[Need(text=text, intent="supplier", evidence="explicit")
+                                      for text in source.explicit_needs])
+
+    async def embed(self, texts, query=False):
+        # Test-only deterministic vectors: never used by the application.
+        return [normalize([b + 1 for b in hashlib.sha256(t.encode()).digest()[:8]])
+                for t in texts]
+
+    async def rerank(self, query, documents):
+        return None
+
+    async def rerank_pairs(self, pairs):
+        return None
+
+
+@pytest.fixture
+def service():
+    remote = FakeProviders()
+    app = create_app(Settings(database_url="sqlite:///:memory:"), providers=remote)
+    with TestClient(app) as client:
+        yield client, remote, app
+
+
+def snapshot(key, **kwargs):
+    return {"id": key, "name": key, "description": "мука", "segment": "food",
+            "explicit_needs": ["мука"], "products": [
+                {"id": "p", "name": "мука", "stock": 5}
+            ], **kwargs}
+
+
+def test_snapshot_cache_and_stock_update(service):
+    client, remote, app = service
+    body = snapshot("a")
+    first = client.put("/v1/clients/a", json=body)
+    assert first.status_code == 200, first.text
+    assert first.json()["changed"]
+    assert not client.put("/v1/clients/a", json=body).json()["changed"]
+    body["products"][0]["stock"] = 0
+    assert client.put("/v1/clients/a", json=body).status_code == 200
+    assert remote.profile_calls == 1
+    assert not any(d.kind == "product" for d in app.state.repository.client("a").documents)
+
+
+def test_feed_event_attribution_dedup_hide_and_search(service):
+    client, _, app = service
+    for key in ("a", "b", "c"):
+        assert client.put(f"/v1/clients/{key}", json=snapshot(key)).status_code == 200
+    response = client.post("/v1/feed", json={"client_id": "a", "seed": 4}).json()
+    assert {i["client_id"] for i in response["items"]} == {"b", "c"}
+    item = response["items"][0]
+    event = {"event_id": "e1", "request_id": response["request_id"], "client_id": "a",
+             "target_client_id": item["client_id"], "kind": "contact"}
+    results = client.post("/v1/events", json={"events": [event, event]}).json()["results"]
+    assert [r["status"] for r in results] == ["accepted", "duplicate"]
+    bad = {**event, "event_id": "bad", "target_client_id": "a"}
+    assert client.post("/v1/events", json={"events": [bad]}).json()["results"][0][
+        "status"
+    ] == "rejected"
+    hide = {**event, "event_id": "hide", "kind": "hide"}
+    assert client.post("/v1/events", json={"events": [hide]}).status_code == 200
+    next_feed = client.post("/v1/feed", json={"client_id": "a"}).json()
+    assert item["client_id"] not in {i["client_id"] for i in next_feed["items"]}
+    search = client.post("/v1/search", json={"client_id": "a", "query": "мука"})
+    assert search.status_code == 200
+    assert search.json()["mode"] == "search"
+    assert client.post("/v1/search", json={"client_id": "a"}).status_code == 422
+    assert len(app.state.repository.user_events("a")) == 2
+
+
+def test_ranker_learns_from_events_and_config_can_disable_it(service):
+    client, _, app = service
+    for key in ("a", "b", "c"):
+        client.put(f"/v1/clients/{key}", json=snapshot(key))
+    first = client.post("/v1/feed", json={"client_id": "a", "seed": 1}).json()
+    selected = first["items"][0]
+    selected_slate = app.state.repository.get(slates, first["request_id"])
+    selected_row = next(row for row in selected_slate["items"]
+                        if row["client_id"] == selected["client_id"])
+    ranker = app.state.engine.ranker
+    ranker.prepare("a")
+    before, _ = ranker.score(selected_row["features"], "a", selected["client_id"])
+    client.post("/v1/events", json={"events": [{
+        "event_id": "contact-ranker", "request_id": first["request_id"], "client_id": "a",
+        "target_client_id": selected["client_id"], "kind": "contact",
+    }]})
+    state = app.state.repository.get(ranker_states, "a")
+    assert len(state["observations"]) == 1
+    assert state["observations"][next(iter(state["observations"]))]["reward"] == 1
+    assert first["diagnostics"]["ranker_mode"] == "linucb"
+    ranker.prepare("a")
+    after, _ = ranker.score(selected_row["features"], "a", selected["client_id"])
+    assert after != before
+
+    FeatureBuilder().build(
+        semantic=0.8, rerank=0.5, graph=0, freshness=0.5,
+        same_region=False, same_city=False, in_stock=True, catalog_size=1,
+        seen=0, is_new=True, intent="supplier",
+    )
+    disabled = create_ranker(Settings(ranker_mode="semantic"), app.state.repository)
+    linucb = create_ranker(Settings(ranker_mode="linucb"), app.state.repository)
+    disabled.prepare("a")
+    linucb.prepare("a")
+    assert disabled.version == "semantic-v1"
+    assert linucb.version == "hybrid-linucb-v1"
+
+
+def test_api_key():
+    app = create_app(Settings(database_url="sqlite:///:memory:", service_api_key="secret"),
+                     providers=FakeProviders())
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/v1/clients/a").status_code == 401
+        assert client.get("/v1/clients/a", headers={"X-API-Key": "secret"}).status_code == 404
+
+
+def test_supplier_retrieval_uses_need_not_viewer_offer(service):
+    client, _, app = service
+    for key in ("bakery", "flour", "other_bakery"):
+        client.put(f"/v1/clients/{key}", json=snapshot(key))
+    repository = app.state.repository
+    for key in ("bakery", "flour", "other_bakery"):
+        indexed = repository.client(key)
+        offer = [1.0, 0.0] if key == "flour" else [0.0, 1.0]
+        indexed.documents = [Document(key="offer", text=key, kind="offer", vector=offer)]
+        if key == "bakery":
+            indexed.documents.append(Document(key="need", text="flour", kind="need",
+                                               intent="supplier", vector=[1.0, 0.0]))
+        repository.put(clients, key, indexed.model_dump(mode="json"))
+    response = client.post("/v1/feed", json={"client_id": "bakery", "intent": "supplier",
+                                             "limit": 1, "seed": 4})
+    assert response.status_code == 200, response.text
+    assert response.json()["items"][0]["client_id"] == "flour"
+
+
+def test_contract_validates_products_and_impression(service):
+    client, _, _ = service
+    body = snapshot("a")
+    body["products"] *= 2
+    assert client.put("/v1/clients/a", json=body).status_code == 422
+    assert client.post("/v1/events", json={"events": [{
+        "event_id": "e", "request_id": "r", "client_id": "a", "target_client_id": "b",
+        "kind": "impression", "visible_fraction": 0.1,
+    }]}).status_code == 422
