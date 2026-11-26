@@ -158,8 +158,12 @@ class Engine:
         # Keep a candidate-generation budget per intent, separate from ranking.
         pool = []
         for intent in Intent:
-            pool.extend([c for c in candidates if c["item"].intent == intent]
-                        [:self.settings.candidate_limit])
+            channel = [c for c in candidates if c["item"].intent == intent]
+            if channel:
+                # Diversity/exploration operate within plausible matches, not the whole catalog.
+                minimum = channel[0]["semantic"] - self.settings.retrieval_score_tolerance
+                pool.extend([c for c in channel if c["semantic"] >= minimum]
+                            [:self.settings.candidate_limit])
 
         # Cross-encoder scores the exact need/offer (or query/offer) pair, including feed.
         reranked = False
@@ -245,6 +249,8 @@ class Engine:
         slate = self.repository.get(slates, event.request_id)
         if not slate or slate["client_id"] != event.client_id:
             raise ValueError("Unknown request_id for this client")
+        if slate.get("ranker_version") != self.ranker.version:
+            raise ValueError("Recommendation model changed; refresh the feed before feedback")
         matched = next((c for c in slate["items"]
                         if c["client_id"] == event.target_client_id), None)
         if not matched:

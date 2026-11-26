@@ -75,8 +75,11 @@ async def main(per_category=8):
             before = await feed()
             control_before = await feed("control")
             snapshots["before"] = before
-            # The other bakery is also an eligible company (description-derived offer).
-            checks["feed_nonempty"] = len(before["items"]) == min(50, per_category * 4 + 1)
+            # Only the two requested product families should survive relevance filtering.
+            checks["feed_nonempty"] = len(before["items"]) == min(50, per_category * 2)
+            checks["irrelevant_sectors_excluded"] = all(
+                x["client_id"].startswith(("supplier-0-", "supplier-1-"))
+                for x in before["items"])
             checks["unique_clients"] = len({x["client_id"] for x in before["items"]}) == len(
                 before["items"])
             checks["reranker_used"] = before["diagnostics"]["reranked"]
@@ -130,9 +133,11 @@ async def main(per_category=8):
             snapshots["opposite_user"] = await feed("control")
             def target_count(slate, prefix, k):
                 return sum(x["client_id"].startswith(prefix) for x in slate["items"][:k])
-            checks["preferred_share_grows_or_saturates"] = (
+            checks["preferred_share_grows_or_diversity_cap"] = (
                 target_count(after, "supplier-1-", 50) > target_count(before, "supplier-1-", 50)
                 or target_count(before, "supplier-1-", 50) == per_category
+                or (target_count(after, "supplier-1-", 50) >= 50 * settings.max_segment_share
+                    and target_count(after, "supplier-0-", 50) > 0)
             )
             # Exercise production defaults too, independently of the deterministic ablation.
             settings.exploration_rate = 0.1

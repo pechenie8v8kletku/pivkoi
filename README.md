@@ -33,7 +33,7 @@ Swagger: `/docs`, OpenAPI: `/openapi.json`, health: `/health`.
 ## Что реализовано
 
 - Полный snapshot клиента и его каталога через `PUT /v1/clients/{id}`.
-- Структурированный бизнес-профиль через Pydantic AI с mock или Qwen3.8-27B API.
+- Структурированный бизнес-профиль и поисковые потребности из карточки через Pydantic AI с mock или Qwen3.8-38B API вашего контура (`LLM_MODEL` — точный alias шлюза).
 - Отдельные эмбеддинги потребностей, предложений, товаров; Qwen3-Embedding-4B.
 - Каналы поставщиков, покупателей, партнёров, коллег/конкурентов.
 - Лента `POST /v1/feed`, семантический поиск `POST /v1/search`.
@@ -54,6 +54,7 @@ Swagger: `/docs`, OpenAPI: `/openapi.json`, health: `/health`.
 - [Алгоритм и границы MVP](docs/ml.md)
 - [Каскад, ранкер и mock API моделей](docs/cascade-and-mock.md)
 - [Синтетический эксперимент и найденные ошибки](docs/synthetic-validation.md)
+- [Смешанный рынок, генерация потребностей и смена интереса](docs/mixed-market-validation.md)
 
 Начальный вариант использует точный перебор векторов, хранимых в SQL JSON.
 Это корректный CPU baseline для небольшого каталога, **не ANN/pgvector**.

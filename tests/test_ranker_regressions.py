@@ -1,9 +1,12 @@
+import random
+from collections import Counter
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from business_match.config import Settings
-from business_match.ranking import FeatureBuilder, LinUCBRanker
+from business_match.ranking import FeatureBuilder, LinUCBRanker, ScoredCandidate, SlatePolicy
 from business_match.schemas import Intent, utcnow
 from business_match.storage import Repository, ranker_states
 
@@ -36,3 +39,42 @@ def test_content_learning_is_personal_and_hide_overrides_contact():
     ranker.update("viewer", "flour", flour, 1, now, terminal=True)
     assert repo.get(ranker_states, "viewer")["observations"]["flour"]["reward"] == 0
     repo.close()
+
+
+def test_content_feedback_is_directional():
+    repo = Repository("sqlite:///:memory:")
+    repo.initialize()
+    ranker = LinUCBRanker(Settings(_env_file=None, linucb_alpha=0), repo)
+    def features(intent):
+        return FeatureBuilder().build(
+            semantic=0.6, rerank=0.5, graph=0, freshness=0.5, same_region=False,
+            same_city=False, in_stock=True, catalog_size=1, seen=0, is_new=True,
+            intent=intent, content_vector=[1, 0])
+    supplier, buyer = features(Intent.supplier), features(Intent.buyer)
+    before = [ranker.score(x, "u", "")[0] for x in (supplier, buyer)]
+    ranker.update("u", "equipment", supplier, 1, utcnow(), terminal=True)
+    delta = [ranker.score(x, "u", "")[0] - b for x, b in zip(
+        (supplier, buyer), before, strict=True)]
+    assert delta[0] > 10 * abs(delta[1])
+    repo.close()
+
+
+def test_slate_preserves_relevant_alternatives_and_role_balance():
+    settings = Settings(_env_file=None, exploration_rate=0)
+    def candidate(index, segment, intent, score):
+        return ScoredCandidate(
+            item=SimpleNamespace(client_id=str(index), segment=segment, intent=intent,
+                                 score=score, exploration=False),
+            vector=[1.0, 0.0], features=[], semantic=0.8, novelty=1.0)
+    suppliers = [candidate(i, "equipment" if i < 20 else "flour",
+                            Intent.supplier, 1.0 if i < 20 else 0.65) for i in range(40)]
+    policy = SlatePolicy(settings)
+    selected = policy.select(suppliers, 20, random.Random(42))
+    assert Counter(c.item.segment for c in selected) == {"equipment": 12, "flour": 8}
+    mixed = suppliers + [candidate(40 + i, "bakery", Intent.peer, 2.0) for i in range(20)]
+    mixed += [candidate(60 + i, "shop", Intent.buyer, 0.6) for i in range(20)]
+    selected = policy.select(mixed, 20, random.Random(42))
+    assert Counter(c.item.intent for c in selected) == {
+        Intent.peer: 4, Intent.supplier: 12, Intent.buyer: 4}
+    # A single eligible sector must still fill the page: the cap is soft.
+    assert len(policy.select(suppliers[:20], 20, random.Random(42))) == 20

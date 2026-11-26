@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     mock_api_base_url: str = "http://127.0.0.1:8010/v1"
     llm_base_url: str = "http://localhost:8001/v1"
     llm_api_key: str = "local"
-    llm_model: str = "Qwen3.8-27B"
+    llm_model: str = "Qwen3.8-38B"
     embedding_base_url: str = "http://localhost:8001/v1"
     embedding_api_key: str = "local"
     embedding_model: str = "Qwen3-Embedding-4B"
@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     ranker_freshness_weight: float = Field(default=0.03, ge=0)
     ranker_region_weight: float = Field(default=0.02, ge=0)
     diversity_weight: float = Field(default=0.12, ge=0)
+    max_segment_share: float = Field(default=0.6, gt=0, le=1)
+    diversity_score_tolerance: float = Field(default=0.2, ge=0)
+    retrieval_score_tolerance: float = Field(default=0.1, ge=0, le=1)
+    max_role_share: float = Field(default=0.6, gt=0, le=1)
+    max_peer_share: float = Field(default=0.2, gt=0, le=1)
     exploration_rate: float = Field(default=0.1, ge=0, le=1)
     exploration_freshness_weight: float = Field(default=1.0, ge=0)
     http_timeout: float = Field(default=45, gt=0)

@@ -15,7 +15,8 @@ FEATURE_NAMES = (
     "semantic", "rerank", "graph", "freshness", "same_region", "same_city",
     "in_stock", "catalog_size", "seen", "new_candidate",
     "intent_supplier", "intent_buyer", "intent_partner", "intent_peer",
-) + tuple(f"content_{i}" for i in range(CONTENT_DIMENSIONS))
+) + tuple(f"content_{intent.value}_{i}" for intent in Intent
+          for i in range(CONTENT_DIMENSIONS))
 EVENT_REWARDS = {
     "open": 0.55,
     "like": 0.8,
@@ -34,7 +35,7 @@ def content_projection(dimensions: int):
 def personal_features(features, metadata_scale):
     """Keep shared relevance/quality metadata in the prior, learn personal content taste."""
     values = np.asarray(features, dtype=float).copy()
-    values[:len(FEATURE_NAMES) - CONTENT_DIMENSIONS] *= metadata_scale
+    values[:14] *= metadata_scale
     return values
 
 
@@ -70,7 +71,9 @@ class FeatureBuilder:
             norm = np.linalg.norm(content)
             if norm:
                 content /= norm
-        values.extend(content.tolist())
+        # Buying equipment must not teach the model to seek equipment vendors as buyers.
+        for channel in Intent:
+            values.extend(content.tolist() if channel == intent else [0.0] * CONTENT_DIMENSIONS)
         return values
 
 
@@ -100,9 +103,9 @@ class SemanticRanker:
 
 
 class LinUCBRanker(SemanticRanker):
-    """Hybrid contextual linear bandit, with semantic score as the cold-start prior."""
+    """Personal residual linear UCB, with a semantic cold-start prior."""
 
-    version = "personal-linear-ucb-v3-content32"
+    version = "personal-linear-ucb-v4-directed-content32"
 
     def __init__(self, settings: Settings, repository: Repository):
         super().__init__(settings)
@@ -211,6 +214,7 @@ class SlatePolicy:
         indices = {id(c): i for i, c in enumerate(pool)}
         redundancy_scores = np.zeros(len(pool))
         segment_counts = {}
+        role_counts = {}
         selected: list[ScoredCandidate] = []
         used = set()
         while pool and len(selected) < limit:
@@ -218,6 +222,21 @@ class SlatePolicy:
                          if candidate.item.client_id not in used]
             if not available:
                 break
+            # Caps are soft: use another eligible role when available, otherwise backfill.
+            balanced = [c for c in available if role_counts.get(c.item.intent, 0) < max(
+                1, int(np.ceil(limit * (self.settings.max_peer_share
+                                       if c.item.intent == Intent.peer
+                                       else self.settings.max_role_share))))]
+            if balanced:
+                available = balanced
+            # Keep a relevant alternative visible without filling the feed with unrelated sectors.
+            best_semantic = max(c.semantic for c in available)
+            diverse = [c for c in available
+                       if segment_counts.get(c.item.segment, 0)
+                       < max(1, int(np.ceil(limit * self.settings.max_segment_share)))
+                       and c.semantic >= best_semantic - self.settings.diversity_score_tolerance]
+            if diverse:
+                available = diverse
 
             def utility(candidate, redundancy_scores=redundancy_scores):
                 redundancy = redundancy_scores[indices[id(candidate)]]
@@ -248,6 +267,7 @@ class SlatePolicy:
                 redundancy_scores, similarities[:, indices[id(choice)]]
             )
             segment_counts[choice.item.segment] = segment_counts.get(choice.item.segment, 0) + 1
+            role_counts[choice.item.intent] = role_counts.get(choice.item.intent, 0) + 1
         return selected
 
 

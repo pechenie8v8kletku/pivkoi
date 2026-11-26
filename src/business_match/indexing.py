@@ -17,7 +17,7 @@ class Indexer:
             revision = fingerprint([
                 source.model_dump(), self.settings.embedding_model,
                 self.settings.llm_model, self.settings.model_api_mode,
-                self.providers.embedding_base_url, self.providers.llm_base_url, "profile-v1",
+                self.providers.embedding_base_url, self.providers.llm_base_url, "profile-v2-search",
             ])
             previous = self.repository.client(source.id)
             if previous and previous.revision == revision:
@@ -30,7 +30,7 @@ class Indexer:
             ]
             profile_revision = fingerprint([
                 semantic, self.settings.llm_model, self.settings.model_api_mode,
-                self.providers.llm_base_url, "profile-v1",
+                self.providers.llm_base_url, "profile-v2-search",
             ])
             if previous and previous.profile_revision == profile_revision:
                 profile = previous.profile
