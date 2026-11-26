@@ -41,6 +41,8 @@ Thumbs.db
 
 # Local synthetic experiments (catalogs, reports, SQLite and event logs)
 /local_experiments/
+# Imported synthetic catalogs stay local; scenario generators are versioned.
+/fixtures/
 *.db-wal
 *.db-shm
 *.db-journal

@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     retrieval_query_batch_size: int = Field(default=64, ge=1, le=1000)
     query_importance_weight: float = Field(default=0.15, ge=0, le=1)
     card_product_limit: int = Field(default=3, ge=0, le=20)
+    business_signals_enabled: bool = True
+    business_signal_boost: float = Field(default=0.12, ge=0, le=0.5)
+    business_signal_half_life_days: float = Field(default=60, gt=0)
+    business_signal_max_age_days: float = Field(default=365, gt=0)
+    business_signal_min_confidence: float = Field(default=0.6, ge=0, le=1)
+    business_signal_completed_weight: float = Field(default=0.5, ge=0, le=1)
+    business_signal_sources_limit: int = Field(default=8, ge=1, le=100)
     content_dimensions: int = Field(default=32, ge=4, le=128)
     content_projection_seed: int = Field(default=42, ge=0)
     catalog_size_scale: int = Field(default=20, ge=1)

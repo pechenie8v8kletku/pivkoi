@@ -110,7 +110,13 @@ class Engine:
                 "item": Recommendation(
                     client_id=source.id, name=source.name, segment=source.segment,
                     region=source.region, city=source.city, intent=intent, score=score,
-                    reason=reason, matched_need=matched_query.text, matched_text=matched.text,
+                    reason=reason,
+                    matched_need=("Сигнал хозяйственной деятельности" if matched_query.evidence
+                                  else matched_query.text),
+                    matched_text=("Сигнал хозяйственной деятельности" if matched.evidence
+                                  else matched.text),
+                    insights=(["Совпадение с наблюдаемой хозяйственной деятельностью"]
+                              if match.evidence_support > 0 else []),
                     products=products,
                 ),
                 "vector": matched.vector, "query": q,
@@ -120,6 +126,7 @@ class Engine:
                 "graph": graph_delta, "graph_known": graph_used,
                 "seen": seen.get(source.id, 0), "is_new": source.id not in seen,
                 "in_stock": bool(products), "catalog_size": len(source.products),
+                "evidence_support": match.evidence_support,
             })
 
         # Cross-encoder scores the exact need/offer (or query/offer) pair, including feed.
@@ -163,6 +170,7 @@ class Engine:
                 seen=candidate["seen"], is_new=candidate["is_new"],
                 intent=candidate["item"].intent,
                 content_vector=candidate["vector"],
+                evidence_support=candidate["evidence_support"],
             )
             score, _ = self.ranker.score(
                 features, request.client_id, candidate["item"].client_id

@@ -244,6 +244,132 @@
   },
   "components": {
     "schemas": {
+      "BusinessContext": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Source Id"
+          },
+          "source_sequence": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Source Sequence"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/BusinessRecord"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "title": "Records"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_id",
+          "source_sequence"
+        ],
+        "title": "BusinessContext"
+      },
+      "BusinessRecord": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "contract",
+              "transfer"
+            ],
+            "title": "Kind"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "buyer",
+              "seller",
+              "unknown"
+            ],
+            "title": "Role",
+            "default": "unknown"
+          },
+          "subject": {
+            "type": "string",
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Subject"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "completed",
+              "cancelled",
+              "pending",
+              "settled",
+              "refunded"
+            ],
+            "title": "Status"
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Occurred At"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "transaction_group_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transaction Group Id"
+          },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "trade",
+              "noncommercial",
+              "unknown"
+            ],
+            "title": "Purpose",
+            "default": "unknown"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "subject",
+          "status",
+          "occurred_at"
+        ],
+        "title": "BusinessRecord"
+      },
       "ClientInput": {
         "properties": {
           "id": {
@@ -316,6 +442,16 @@
             "type": "boolean",
             "title": "Active",
             "default": true
+          },
+          "business_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BusinessContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -703,6 +839,13 @@
             "type": "boolean",
             "title": "Exploration",
             "default": false
+          },
+          "insights": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Insights"
           }
         },
         "type": "object",

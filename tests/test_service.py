@@ -129,7 +129,7 @@ def test_ranker_learns_from_events_and_config_can_disable_it(service):
     linucb = create_ranker(Settings(ranker_mode="linucb"), app.state.repository)
     disabled.prepare("a")
     linucb.prepare("a")
-    assert disabled.version == "semantic-v1"
+    assert disabled.version == "semantic-v2-evidence"
     assert linucb.version.startswith("personal-linear-ucb-v5-")
 
 

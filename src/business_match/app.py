@@ -7,6 +7,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.security import APIKeyHeader
 
+from business_match.business_signals import ContextConflict
 from business_match.config import Settings, get_settings
 from business_match.engine import Engine
 from business_match.indexing import Indexer
@@ -62,7 +63,10 @@ def create_app(settings: Settings | None = None, providers=None) -> FastAPI:
         if client_id != source.id:
             raise HTTPException(422, "Path and body client IDs must match")
         try:
-            indexed, changed = await request.app.state.indexer.upsert(source)
+            async with request.app.state.recommend_lock:
+                indexed, changed = await request.app.state.indexer.upsert(source)
+        except ContextConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         except (httpx.HTTPError, ValueError) as exc:
             logger.exception("Indexing failed")
             raise HTTPException(502, "Profile/embedding provider failed; retry snapshot") from exc

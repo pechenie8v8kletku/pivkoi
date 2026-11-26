@@ -50,6 +50,12 @@ ranker_states = Table(
     Column("id", String(128), primary_key=True),
     Column("payload", JSON, nullable=False),
 )
+business_contexts = Table(
+    "bm_business_contexts", metadata,
+    Column("id", String(64), primary_key=True),
+    Column("client_id", String(128), index=True, nullable=False),
+    Column("payload", JSON, nullable=False),
+)
 
 
 class Repository:
@@ -97,6 +103,11 @@ class Repository:
                 IndexedClient.model_validate(p)
                 for p in conn.execute(select(clients.c.payload)).scalars()
             ]
+
+    def contexts(self, client_id: str) -> list[dict]:
+        with self.engine.connect() as conn:
+            return list(conn.execute(select(business_contexts.c.payload).where(
+                business_contexts.c.client_id == client_id)).scalars())
 
     def iter_client_batches(self, batch_size: int, *, region=None, city=None):
         """Keyset pagination: bound decoded catalog memory; no OFFSET or long read transaction."""

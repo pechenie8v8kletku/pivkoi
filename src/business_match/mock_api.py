@@ -66,6 +66,9 @@ def client_profile(source: dict[str, Any]) -> dict[str, Any]:
 
 def response_for_schema(schema: dict, source: dict[str, Any]) -> dict[str, Any]:
     properties = schema.get("properties", {})
+    if "commercial" in properties and "confidence" in properties:
+        # No invented semantic capability: tests inject controlled extractor responses.
+        return {"subject": "", "role": "unknown", "commercial": False, "confidence": 0}
     profile = client_profile(source)
     output = {}
     for key, definition in properties.items():

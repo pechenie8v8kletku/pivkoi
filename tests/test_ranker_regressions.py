@@ -21,7 +21,7 @@ def test_configured_features_invalidate_incompatible_saved_training():
                              same_region=False, same_city=False, in_stock=True, catalog_size=2,
                              seen=0, is_new=True, intent=Intent.supplier, content_vector=[1, 0])
     ranker = LinUCBRanker(settings, repo)
-    assert len(features) == 14 + len(Intent) * 8
+    assert len(features) == 15 + len(Intent) * 8
     for i in range(3):
         ranker.update("u", str(i), features, 1, utcnow(), terminal=True)
     assert set(repo.get(ranker_states, "u")["observations"]) == {"1", "2"}

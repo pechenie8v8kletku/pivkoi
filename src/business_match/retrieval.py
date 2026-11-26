@@ -6,8 +6,9 @@ from typing import Protocol
 
 import numpy as np
 
+from business_match.business_signals import support
 from business_match.config import Settings
-from business_match.schemas import Document, IndexedClient, Intent, RecommendRequest
+from business_match.schemas import Document, IndexedClient, Intent, RecommendRequest, utcnow
 from business_match.storage import Repository
 
 
@@ -18,6 +19,7 @@ class CandidateMatch:
     query: Document
     document: Document
     semantic: float
+    evidence_support: float = 0.0
 
 
 class CandidateRetriever(Protocol):
@@ -36,6 +38,10 @@ class ExactRetriever:
         self.repository, self.settings = repository, settings
 
     def retrieve(self, viewer, request, hidden, query_vector):
+        now = utcnow()
+        def usable(document):
+            return not document.evidence or support(document, self.settings, now) > 0
+
         channels = [request.intent] if request.intent else list(Intent)
         queries = {}
         for intent in channels:
@@ -48,6 +54,8 @@ class ExactRetriever:
                 docs = [d for d in viewer.documents if d.kind == "offer"]
             else:
                 docs = [d for d in viewer.documents if d.kind == "need" and d.intent == intent]
+            docs = [d for d in docs if usable(d)
+                    and not (intent == Intent.peer and d.evidence)]
             if docs:
                 queries[intent] = docs
         heaps = {intent: [] for intent in queries}
@@ -78,17 +86,25 @@ class ExactRetriever:
                         weights = np.asarray([1 - weight + weight * q.weight for q in qdocs])
                         scores = (np.clip(qvectors @ vectors.T, -1, 1) + 1) / 2
                         scores *= weights[:, None]
-                        positions = scores.argmax(axis=0)
+                        evidence = np.maximum(
+                            np.asarray([support(q, self.settings, now)
+                                        for q in qdocs])[:, None],
+                            np.asarray([support(d, self.settings, now)
+                                        for _, d in block])[None, :])
+                        evidence *= scores
+                        effective = scores + self.settings.business_signal_boost * evidence
+                        positions = effective.argmax(axis=0)
                         for column, (target, document) in enumerate(block):
                             qi = int(positions[column])
-                            score = float(scores[qi, column])
+                            score = float(effective[qi, column])
                             old = best.get(target.source.id)
                             # Stable document-key order makes ties independent of block sizes.
                             order = (offset + qi, document.key)
                             if (old is None or score > old[0]
                                     or (score == old[0] and order < old[1])):
                                 best[target.source.id] = (score, order, CandidateMatch(
-                                    target, intent, qdocs[qi], document, score))
+                                    target, intent, qdocs[qi], document,
+                                    float(scores[qi, column]), float(evidence[qi, column])))
                     block.clear()
 
                 for target in targets:
@@ -96,7 +112,9 @@ class ExactRetriever:
                         eligible = (document.kind == "need" and document.intent == Intent.supplier
                                     if intent == Intent.buyer
                                     else document.kind in ("offer", "product"))
-                        if eligible:
+                        if eligible and usable(document) and not (
+                            intent == Intent.peer and document.evidence
+                        ):
                             block.append((target, document))
                             if len(block) >= self.settings.retrieval_document_batch_size:
                                 score_block()

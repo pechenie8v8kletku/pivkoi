@@ -15,6 +15,7 @@ METADATA_FEATURE_NAMES = (
     "semantic", "rerank", "graph", "freshness", "same_region", "same_city",
     "in_stock", "catalog_size", "seen", "new_candidate",
     "intent_supplier", "intent_buyer", "intent_partner", "intent_peer",
+    "evidence_support",
 )
 
 
@@ -35,6 +36,9 @@ def training_signature(settings: Settings):
         "reward_dwell_max", "dwell_min_ms", "dwell_saturation_ms",
         "ranker_rerank_weight", "ranker_graph_weight",
         "ranker_freshness_weight", "ranker_region_weight",
+        "business_signals_enabled", "business_signal_boost",
+        "business_signal_half_life_days", "business_signal_max_age_days",
+        "business_signal_min_confidence", "business_signal_completed_weight",
     )
     values = {field: getattr(settings, field) for field in fields}
     values["provider"] = (settings.mock_api_base_url if settings.model_api_mode == "mock"
@@ -78,7 +82,8 @@ class FeatureBuilder:
     def build(self, *, semantic: float, rerank: float, graph: float, freshness: float,
               same_region: bool, same_city: bool, in_stock: bool, catalog_size: int,
               seen: float, is_new: bool, intent: Intent,
-              content_vector: list[float] | None = None) -> list[float]:
+              content_vector: list[float] | None = None,
+              evidence_support: float = 0.0) -> list[float]:
         values = [
             semantic, rerank, graph, freshness, float(same_region), float(same_city),
             float(in_stock), min(1.0, np.log1p(catalog_size)
@@ -86,6 +91,7 @@ class FeatureBuilder:
             seen, float(is_new),
         ]
         values.extend(float(intent == channel) for channel in Intent)
+        values.append(evidence_support)
         # Stable random projection: let the personal model distinguish flour from packaging,
         # even if their scalar semantic scores and other metadata are identical.
         dimensions = self.settings.content_dimensions
@@ -106,7 +112,7 @@ class FeatureBuilder:
 class SemanticRanker:
     """Deterministic cold-start ranker; all optional priors are configurable."""
 
-    version = "semantic-v1"
+    version = "semantic-v2-evidence"
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -121,6 +127,9 @@ class SemanticRanker:
         score += self.settings.ranker_graph_weight * graph
         score += self.settings.ranker_freshness_weight * freshness
         score += self.settings.ranker_region_weight * same_region
+        if self.settings.business_signals_enabled:
+            score += self.settings.business_signal_boost * features[
+                METADATA_FEATURE_NAMES.index("evidence_support")]
         return score, 0.0
 
     def update(self, client_id: str, key: str, features: list[float], reward: float,

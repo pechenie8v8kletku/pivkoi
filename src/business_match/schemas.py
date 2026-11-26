@@ -31,6 +31,55 @@ class Product(BaseModel):
     active: bool = True
 
 
+class BusinessRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: Id
+    kind: Literal["contract", "transfer"]
+    role: Literal["buyer", "seller", "unknown"] = "unknown"
+    subject: Text
+    status: Literal["active", "completed", "cancelled", "pending", "settled", "refunded"]
+    occurred_at: datetime
+    valid_until: datetime | None = None
+    transaction_group_id: Id | None = None
+    purpose: Literal["trade", "noncommercial", "unknown"] = "unknown"
+
+    @model_validator(mode="after")
+    def valid_record(self):
+        statuses = ({"active", "completed", "cancelled"} if self.kind == "contract"
+                    else {"pending", "settled", "refunded"})
+        if self.status not in statuses:
+            raise ValueError("Status does not match record kind")
+        for date in (self.occurred_at, self.valid_until):
+            if date is not None and date.utcoffset() is None:
+                raise ValueError("Business record dates require a timezone")
+        if self.occurred_at > utcnow():
+            raise ValueError("Business record is in the future")
+        if self.valid_until is not None and self.valid_until < self.occurred_at:
+            raise ValueError("valid_until precedes occurred_at")
+        return self
+
+
+class BusinessContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: Id
+    source_sequence: int = Field(ge=0)
+    records: list[BusinessRecord] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def unique_records(self):
+        if len({r.id for r in self.records}) != len(self.records):
+            raise ValueError("Business record IDs must be unique per source")
+        return self
+
+
+class SignalExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    subject: Annotated[str, Field(max_length=300)] = ""
+    role: Literal["buyer", "seller", "unknown"] = "unknown"
+    commercial: bool = False
+    confidence: float = Field(default=0, ge=0, le=1)
+
+
 class ClientInput(BaseModel):
     """Full current snapshot; omitted products are deleted from this client's catalog."""
 
@@ -43,9 +92,13 @@ class ClientInput(BaseModel):
     explicit_needs: list[Text] = Field(default_factory=list, max_length=30)
     products: list[Product] = Field(default_factory=list, max_length=5000)
     active: bool = True
+    # Write-only: never serialize private source records in GET /clients or the profile prompt.
+    business_context: BusinessContext | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def unique_products(self):
+        if "business_context" in self.model_fields_set and self.business_context is None:
+            raise ValueError("Omit business_context to preserve it; use records=[] to clear")
         if len({p.id for p in self.products}) != len(self.products):
             raise ValueError("Product IDs must be unique within a client")
         return self
@@ -72,6 +125,10 @@ class Document(BaseModel):
     product_id: str | None = None
     weight: float = 1
     vector: list[float]
+    evidence: bool = False
+    support: float = 0
+    observed_at: datetime | None = None
+    expires_at: datetime | None = None
 
 
 class IndexedClient(BaseModel):
@@ -114,6 +171,7 @@ class Recommendation(BaseModel):
     matched_text: str
     products: list[ProductMatch]
     exploration: bool = False
+    insights: list[str] = Field(default_factory=list)
 
 
 class RecommendationResponse(BaseModel):

@@ -1,5 +1,6 @@
 import asyncio
 
+from business_match.business_signals import BusinessSignals
 from business_match.config import Settings
 from business_match.providers import Providers, fingerprint
 from business_match.schemas import ClientInput, Document, IndexedClient, utcnow
@@ -10,12 +11,17 @@ class Indexer:
     def __init__(self, repository: Repository, providers: Providers, settings: Settings):
         self.repository, self.providers, self.settings = repository, providers, settings
         self.lock = asyncio.Lock()
+        self.signals = BusinessSignals(repository, providers, settings)
 
     async def upsert(self, source: ClientInput) -> tuple[IndexedClient, bool]:
         # Single-worker MVP: serialize indexing so concurrent snapshots cannot overwrite each other.
         async with self.lock:
+            sources, context_updates, context_revision = await self.signals.stage(
+                source.id, source.business_context)
+            # Remove the write-only context before persisting or prompting the public profile.
+            source = ClientInput.model_validate(source.model_dump())
             revision = fingerprint([
-                source.model_dump(), self.settings.embedding_model,
+                source.model_dump(), context_revision, self.settings.embedding_model,
                 self.settings.llm_model, self.settings.model_api_mode,
                 self.providers.embedding_base_url, self.providers.llm_base_url, "profile-v2-search",
             ])
@@ -76,6 +82,7 @@ class Indexer:
                     zip(plain + needs, plain_vectors + need_vectors, strict=True)
                 )
             ]
+            documents.extend(await self.signals.documents(sources))
             now = utcnow()
             content_updated_at = (
                 (previous.content_updated_at or previous.created_at)
@@ -88,5 +95,7 @@ class Indexer:
                 content_updated_at=content_updated_at,
                 updated_at=now,
             )
-            self.repository.put(clients, source.id, indexed.model_dump(mode="json"))
+            with self.repository.transaction() as conn:
+                self.signals.commit(source.id, context_updates, conn)
+                self.repository.put(clients, source.id, indexed.model_dump(mode="json"), conn=conn)
             return indexed, True
