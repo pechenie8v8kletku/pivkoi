@@ -94,6 +94,10 @@ def test_slate_preserves_relevant_alternatives_and_role_balance():
     policy = SlatePolicy(settings)
     selected = policy.select(suppliers, 20, random.Random(42))
     assert Counter(c.item.segment for c in selected) == {"equipment": 12, "flour": 8}
+    # Search may return one relevant category without a forced cross-category quota.
+    searched = policy.select(suppliers, 20, random.Random(42),
+                             enable_exploration=False, balance_segments=False)
+    assert Counter(c.item.segment for c in searched) == {"equipment": 20}
     mixed = suppliers + [candidate(40 + i, "bakery", Intent.peer, 2.0) for i in range(20)]
     mixed += [candidate(60 + i, "shop", Intent.buyer, 0.6) for i in range(20)]
     selected = policy.select(mixed, 20, random.Random(42))

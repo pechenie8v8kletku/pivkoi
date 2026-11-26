@@ -99,12 +99,16 @@ class Engine:
                               score=(similarity(q, d.vector) + 1) / 2)
                  for d in target.documents if d.product_id in by_id],
                 key=lambda p: p.score, reverse=True,
-            )[:self.settings.card_product_limit]
+            )
+            if products:
+                threshold = products[0].score - self.settings.card_product_score_tolerance
+                products = [p for p in products if p.score >= threshold]
+            products = products[:self.settings.card_product_limit]
             reason = {
-                Intent.supplier: "Potential supplier for this need",
-                Intent.buyer: "Potential buyer for your offer",
-                Intent.partner: "Potential complementary business partner",
-                Intent.peer: "Company with a similar offer",
+                Intent.supplier: "Возможный поставщик по вашему запросу",
+                Intent.buyer: "Возможный покупатель вашего предложения",
+                Intent.partner: "Возможный партнёр с дополняющим предложением",
+                Intent.peer: "Компания с похожим предложением",
             }[intent]
             pool.append({
                 "item": Recommendation(
@@ -184,7 +188,8 @@ class Engine:
         ranking_ms = (perf_counter() - ranking_started) * 1000
         slate_started = perf_counter()
         selected = self.slate_policy.select(
-            prepared, request.limit, rng, enable_exploration=not bool(request.query)
+            prepared, request.limit, rng, enable_exploration=not bool(request.query),
+            balance_segments=not bool(request.query),
         )
         request_id = str(uuid4())
         ranker_payload = self.repository.get(ranker_states, request.client_id) or {}

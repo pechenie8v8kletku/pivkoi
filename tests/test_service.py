@@ -92,6 +92,13 @@ def test_feed_event_attribution_dedup_hide_and_search(service):
     search = client.post("/v1/search", json={"client_id": "a", "query": "мука"})
     assert search.status_code == 200
     assert search.json()["mode"] == "search"
+    assert search.json()["items"]
+    assert all(item["intent"] == "supplier" for item in search.json()["items"])
+    explicit = client.post("/v1/search", json={
+        "client_id": "a", "query": "offers", "intent": "buyer"})
+    assert explicit.status_code == 200
+    assert explicit.json()["items"]
+    assert all(item["intent"] == "buyer" for item in explicit.json()["items"])
     assert client.post("/v1/search", json={"client_id": "a"}).status_code == 422
     assert len(app.state.repository.user_events("a")) == 2
 
@@ -170,3 +177,32 @@ def test_contract_validates_products_and_impression(service):
         "event_id": "e", "request_id": "r", "client_id": "a", "target_client_id": "b",
         "kind": "impression", "visible_fraction": 0.1,
     }]}).status_code == 422
+
+
+def test_card_keeps_relevant_products_without_catalog_padding(service):
+    client, _, app = service
+    client.put("/v1/clients/viewer", json=snapshot("viewer"))
+    client.put("/v1/clients/vendor", json=snapshot("vendor", products=[
+        {"id": "relevant", "name": "Product A", "stock": 5},
+        {"id": "irrelevant", "name": "Product B", "stock": 5},
+        {"id": "unavailable", "name": "Product C", "stock": 0},
+    ]))
+    repository = app.state.repository
+    viewer = repository.client("viewer")
+    viewer.documents = [Document(key="need", text="need", kind="need",
+                                 intent="supplier", vector=[1.0, 0.0])]
+    vendor = repository.client("vendor")
+    vendor.documents = [
+        Document(key=key, text=key, kind="product", product_id=key, vector=vector)
+        for key, vector in [("relevant", [1.0, 0.0]),
+                            ("irrelevant", [0.0, 1.0]),
+                            ("unavailable", [1.0, 0.0])]
+    ]
+    for indexed in (viewer, vendor):
+        repository.put(clients, indexed.source.id, indexed.model_dump(mode="json"))
+    response = client.post("/v1/feed", json={
+        "client_id": "viewer", "intent": "supplier", "seed": 42})
+    assert response.status_code == 200, response.text
+    assert len(response.json()["items"]) == 1
+    products = response.json()["items"][0]["products"]
+    assert [p["product"]["id"] for p in products] == ["relevant"]

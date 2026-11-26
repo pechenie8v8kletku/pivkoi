@@ -15,6 +15,7 @@ from business_match.providers import Providers
 from business_match.schemas import (
     ClientInput,
     FeedbackBatch,
+    Intent,
     RecommendationResponse,
     RecommendRequest,
 )
@@ -93,6 +94,9 @@ def create_app(settings: Settings | None = None, providers=None) -> FastAPI:
     async def search(body: RecommendRequest, request: Request):
         if not body.query or not body.query.strip():
             raise HTTPException(422, "Search requires a nonempty query")
+        # A bare product query means finding a supplier; other roles remain explicit.
+        if body.intent is None:
+            body = body.model_copy(update={"intent": Intent.supplier})
         return await recommend(body, request)
 
     async def recommend(body, request):

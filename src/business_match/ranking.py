@@ -242,7 +242,8 @@ class SlatePolicy:
         self.settings = settings
 
     def select(self, candidates: list[ScoredCandidate], limit: int, rng,
-               enable_exploration: bool = True) -> list[ScoredCandidate]:
+               enable_exploration: bool = True,
+               balance_segments: bool = True) -> list[ScoredCandidate]:
         pool = list(candidates)
         if not pool:
             return []
@@ -272,7 +273,7 @@ class SlatePolicy:
                        if segment_counts.get(c.item.segment, 0)
                        < max(1, int(np.ceil(limit * self.settings.max_segment_share)))
                        and c.semantic >= best_semantic - self.settings.diversity_score_tolerance]
-            if diverse:
+            if diverse and balance_segments:
                 available = diverse
 
             def utility(candidate, redundancy_scores=redundancy_scores):

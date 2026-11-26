@@ -148,7 +148,9 @@ class RecommendRequest(BaseModel):
     query: Annotated[str, Field(min_length=1, max_length=1000)] | None = None
     region: str | None = None
     city: str | None = None
-    intent: Intent | None = None
+    intent: Intent | None = Field(default=None, description=(
+        "Relationship direction. Omitted in feed: mix roles. "
+        "Omitted in search: supplier. Set buyer/partner/peer explicitly when needed."))
     exclude_client_ids: list[Id] = Field(default_factory=list, max_length=1000)
     seed: int | None = None
 

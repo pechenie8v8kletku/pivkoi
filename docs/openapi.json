@@ -743,7 +743,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Relationship direction. Omitted in feed: mix roles. Omitted in search: supplier. Set buyer/partner/peer explicitly when needed."
           },
           "exclude_client_ids": {
             "items": {

@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     retrieval_query_batch_size: int = Field(default=64, ge=1, le=1000)
     query_importance_weight: float = Field(default=0.15, ge=0, le=1)
     card_product_limit: int = Field(default=3, ge=0, le=20)
+    card_product_score_tolerance: float = Field(default=0.1, ge=0, le=1)
     business_signals_enabled: bool = True
     business_signal_boost: float = Field(default=0.12, ge=0, le=0.5)
     business_signal_half_life_days: float = Field(default=60, gt=0)
