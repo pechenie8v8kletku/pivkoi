@@ -175,9 +175,13 @@ class Engine:
             rerank_scores = await self.providers.rerank_pairs(pairs)
             if rerank_scores is not None:
                 # Per-request percentile avoids assuming provider scores are calibrated.
-                order = sorted(range(len(rerank_scores)), key=lambda i: rerank_scores[i])
-                ranks = {index: rank / (len(order) - 1) if len(order) > 1 else 0.5
-                         for rank, index in enumerate(order)}
+                # Equal cross-encoder scores must not create arbitrary ranking differences.
+                ranks = {
+                    i: (sum(s < score for s in rerank_scores)
+                        + (sum(s == score for s in rerank_scores) - 1) / 2)
+                    / (len(rerank_scores) - 1) if len(rerank_scores) > 1 else 0.5
+                    for i, score in enumerate(rerank_scores)
+                }
                 for index, candidate in enumerate(rerank_candidates):
                     candidate["rerank"] = ranks[index]
                 reranked = True
@@ -192,6 +196,7 @@ class Engine:
                 in_stock=candidate["in_stock"], catalog_size=candidate["catalog_size"],
                 seen=candidate["seen"], is_new=candidate["is_new"],
                 intent=candidate["item"].intent,
+                content_vector=candidate["vector"],
             )
             score, _ = self.ranker.score(
                 features, request.client_id, candidate["item"].client_id
@@ -244,8 +249,8 @@ class Engine:
             raise ValueError("Target was not included in this slate")
         if event.product_id and event.product_id not in matched["product_ids"]:
             raise ValueError("Product was not included in this card")
-            if event.occurred_at > utcnow() + timedelta(minutes=5):
-                raise ValueError("Event timestamp is in the future")
+        if event.occurred_at > utcnow() + timedelta(minutes=5):
+            raise ValueError("Event timestamp is in the future")
         if event.occurred_at < datetime.fromisoformat(slate["created_at"]):
             raise ValueError("Event predates recommendation request")
         payload = {"event": event.model_dump(mode="json"), "received_at": utcnow().isoformat(),

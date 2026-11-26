@@ -38,3 +38,9 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local synthetic experiments (catalogs, reports, SQLite and event logs)
+/local_experiments/
+*.db-wal
+*.db-shm
+*.db-journal

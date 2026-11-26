@@ -53,6 +53,7 @@ Swagger: `/docs`, OpenAPI: `/openapi.json`, health: `/health`.
 - [Контракт интеграции, события и API провайдеров](docs/integration.md)
 - [Алгоритм и границы MVP](docs/ml.md)
 - [Каскад, ранкер и mock API моделей](docs/cascade-and-mock.md)
+- [Синтетический эксперимент и найденные ошибки](docs/synthetic-validation.md)
 
 Начальный вариант использует точный перебор векторов, хранимых в SQL JSON.
 Это корректный CPU baseline для небольшого каталога, **не ANN/pgvector**.

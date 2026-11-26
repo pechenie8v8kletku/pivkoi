@@ -1,7 +1,7 @@
 """Replaceable feature, scoring, and slate-policy stages of the recommendation cascade."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -9,11 +9,12 @@ from business_match.config import Settings
 from business_match.schemas import Intent, utcnow
 from business_match.storage import Repository, ranker_states
 
+CONTENT_DIMENSIONS = 32
 FEATURE_NAMES = (
     "semantic", "rerank", "graph", "freshness", "same_region", "same_city",
     "in_stock", "catalog_size", "seen", "new_candidate",
     "intent_supplier", "intent_buyer", "intent_partner", "intent_peer",
-)
+) + tuple(f"content_{i}" for i in range(CONTENT_DIMENSIONS))
 EVENT_REWARDS = {
     "open": 0.55,
     "like": 0.8,
@@ -37,13 +38,26 @@ class ScoredCandidate:
 class FeatureBuilder:
     def build(self, *, semantic: float, rerank: float, graph: float, freshness: float,
               same_region: bool, same_city: bool, in_stock: bool, catalog_size: int,
-              seen: float, is_new: bool, intent: Intent) -> list[float]:
+              seen: float, is_new: bool, intent: Intent,
+              content_vector: list[float] | None = None) -> list[float]:
         values = [
             semantic, rerank, graph, freshness, float(same_region), float(same_city),
             float(in_stock), min(1.0, np.log1p(catalog_size) / np.log(21)),
             seen, float(is_new),
         ]
         values.extend(float(intent == channel) for channel in Intent)
+        # Stable random projection: let the personal model distinguish flour from packaging,
+        # even if their scalar semantic scores and other metadata are identical.
+        content = np.zeros(CONTENT_DIMENSIONS)
+        if content_vector:
+            projection = np.random.default_rng(42).standard_normal(
+                (CONTENT_DIMENSIONS, len(content_vector))
+            ) / np.sqrt(CONTENT_DIMENSIONS)
+            content = projection @ np.asarray(content_vector)
+            norm = np.linalg.norm(content)
+            if norm:
+                content /= norm
+        values.extend(content.tolist())
         return values
 
 
@@ -75,7 +89,7 @@ class SemanticRanker:
 class LinUCBRanker(SemanticRanker):
     """Hybrid contextual linear bandit, with semantic score as the cold-start prior."""
 
-    version = "hybrid-linucb-v1"
+    version = "personal-linear-ucb-v2-content32"
 
     def __init__(self, settings: Settings, repository: Repository):
         super().__init__(settings)
@@ -85,6 +99,8 @@ class LinUCBRanker(SemanticRanker):
     def prepare(self, client_id: str) -> None:
         """Build posterior once per recommendation request, rather than per candidate."""
         payload = self.repository.get(ranker_states, client_id)
+        if payload and payload.get("version") != self.version:
+            payload = None
         observations = (payload or {}).get("observations", {})
         dimension = len(FEATURE_NAMES)
         matrix = self.settings.linucb_regularization * np.eye(dimension)
@@ -121,13 +137,13 @@ class LinUCBRanker(SemanticRanker):
         payload = self.repository.get(ranker_states, client_id, conn=conn) or {
             "observations": {}, "version": self.version,
         }
+        if payload.get("version") != self.version:
+            payload = {"observations": {}, "version": self.version}
         observations = payload["observations"]
         previous = observations.get(key)
-        timestamp = occurred_at.isoformat()
+        timestamp = occurred_at.astimezone(UTC).isoformat()
         if previous:
             if previous.get("terminal") and not terminal:
-                return
-            if previous.get("terminal") and terminal and previous["reward"] >= reward:
                 return
             if previous.get("occurred_at", "") > timestamp:
                 return
@@ -154,6 +170,7 @@ class LinUCBRanker(SemanticRanker):
         payload["observations"] = observations
         payload["version"] = self.version
         self.repository.put(ranker_states, client_id, payload, conn=conn)
+        self._request_model = None
 
 
 def create_ranker(settings: Settings, repository: Repository):
@@ -211,4 +228,4 @@ class SlatePolicy:
 
 
 def observation_key(target_id: str, intent: str, occurred_at: datetime) -> str:
-    return f"{target_id}|{intent}|{occurred_at.date().isoformat()}"
+    return f"{target_id}|{intent}|{occurred_at.astimezone(UTC).date().isoformat()}"
