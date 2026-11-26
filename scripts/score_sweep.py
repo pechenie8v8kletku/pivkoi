@@ -28,7 +28,7 @@ async def run(args):
     rows, responses = [], []
     original = os.environ.get("RANKER_PERSONAL_WEIGHT")
     try:
-        for weight in [0, 0.5, 1, 2]:
+        for weight in args.weights:
             output = root / str(weight)
             output.mkdir()
             with sqlite3.connect(args.source) as src, sqlite3.connect(output / "service.db") as dst:
@@ -120,7 +120,7 @@ async def run(args):
         else:
             os.environ["RANKER_PERSONAL_WEIGHT"] = original
     summary = []
-    for weight in [0, 0.5, 1, 2]:
+    for weight in args.weights:
         for kind in ["feed", "heldout", "search_current", "search_previous"]:
             group = [r for r in rows if r["weight"] == weight and r["kind"] == kind]
             total = sum(r["returned"] for r in group)
@@ -164,4 +164,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8012)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
+    parser.add_argument("--weights", type=float, nargs="+", default=[0, 0.5, 1, 2])
     asyncio.run(run(parser.parse_args()))
