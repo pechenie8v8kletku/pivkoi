@@ -16,7 +16,8 @@ class Indexer:
         async with self.lock:
             revision = fingerprint([
                 source.model_dump(), self.settings.embedding_model,
-                self.settings.llm_model, "profile-v1",
+                self.settings.llm_model, self.settings.model_api_mode,
+                self.providers.embedding_base_url, self.providers.llm_base_url, "profile-v1",
             ])
             previous = self.repository.client(source.id)
             if previous and previous.revision == revision:
@@ -27,7 +28,10 @@ class Indexer:
                 p.model_dump(exclude={"stock", "price", "active", "unit"})
                 for p in sorted(source.products, key=lambda p: p.id)
             ]
-            profile_revision = fingerprint([semantic, self.settings.llm_model, "profile-v1"])
+            profile_revision = fingerprint([
+                semantic, self.settings.llm_model, self.settings.model_api_mode,
+                self.providers.llm_base_url, "profile-v1",
+            ])
             if previous and previous.profile_revision == profile_revision:
                 profile = previous.profile
             else:

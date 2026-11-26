@@ -56,7 +56,7 @@ class RelationGraph:
                 "source_segment": source_segment,
                 "target_segment": target_segment,
                 "intent": intent,
-                "exposures": 1,
+                "exposures": 0,
                 "positive": 0.0,
                 "negative": 0.0,
                 "updated_at": utcnow().isoformat(),

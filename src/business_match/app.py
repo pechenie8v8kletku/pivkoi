@@ -103,17 +103,18 @@ def create_app(settings: Settings | None = None, providers=None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
 
     @app.post("/v1/events", dependencies=[Depends(authorize)])
-    def events(body: FeedbackBatch, request: Request):
+    async def events(body: FeedbackBatch, request: Request):
         # Per-event outcomes allow safe retry of mixed batches using the same event IDs.
         results = []
-        for event in body.events:
-            try:
-                inserted = request.app.state.engine.ingest(event)
-                results.append({"event_id": event.event_id,
-                                "status": "accepted" if inserted else "duplicate"})
-            except ValueError as exc:
-                results.append({"event_id": event.event_id, "status": "rejected",
-                                "detail": str(exc)})
+        async with request.app.state.recommend_lock:
+            for event in body.events:
+                try:
+                    inserted = request.app.state.engine.ingest(event)
+                    results.append({"event_id": event.event_id,
+                                    "status": "accepted" if inserted else "duplicate"})
+                except ValueError as exc:
+                    results.append({"event_id": event.event_id, "status": "rejected",
+                                    "detail": str(exc)})
         return {"results": results}
 
     return app

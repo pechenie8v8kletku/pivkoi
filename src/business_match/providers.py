@@ -118,7 +118,8 @@ class Providers:
             "Instruct: Retrieve business offers or companies relevant to this B2B need.\nQuery: "
             + text if query else text for text in texts
         ]
-        keys = [fingerprint([self.settings.embedding_model, t]) for t in rendered]
+        keys = [fingerprint([self.settings.model_api_mode, self.embedding_base_url,
+                             self.settings.embedding_model, t]) for t in rendered]
         found = {key: self.repository.get(cache, key) for key in set(keys)}
         missing = list(dict.fromkeys(key for key in keys if found[key] is None))
         lookup = dict(zip(keys, rendered, strict=True))

@@ -8,10 +8,13 @@ from business_match.config import Settings
 from business_match.providers import normalize
 from business_match.ranking import FeatureBuilder, create_ranker
 from business_match.schemas import BusinessProfile, Document, Need
-from business_match.storage import clients, ranker_states, slates
+from business_match.storage import clients, ranker_states, relation_observations, slates
 
 
 class FakeProviders:
+    embedding_base_url = "test://embedding"
+    llm_base_url = "test://llm"
+
     def __init__(self):
         self.profile_calls = 0
 
@@ -73,6 +76,11 @@ def test_feed_event_attribution_dedup_hide_and_search(service):
              "target_client_id": item["client_id"], "kind": "contact"}
     results = client.post("/v1/events", json={"events": [event, event]}).json()["results"]
     assert [r["status"] for r in results] == ["accepted", "duplicate"]
+    from sqlalchemy import select
+
+    with app.state.repository.engine.connect() as conn:
+        observation = conn.execute(select(relation_observations.c.payload)).scalar_one()
+    assert observation["exposures"] == 1
     bad = {**event, "event_id": "bad", "target_client_id": "a"}
     assert client.post("/v1/events", json={"events": [bad]}).json()["results"][0][
         "status"
