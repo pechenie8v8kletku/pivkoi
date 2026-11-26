@@ -1,10 +1,51 @@
 import asyncio
+from collections import deque
 
 from business_match.business_signals import BusinessSignals
 from business_match.config import Settings
 from business_match.providers import Providers, fingerprint
 from business_match.schemas import ClientInput, Document, IndexedClient, utcnow
 from business_match.storage import Repository, clients
+
+PROFILE_VERSION = "profile-v3-bounded-input"
+
+
+def catalog_content(source: ClientInput):
+    semantic = source.model_dump(exclude={"region", "city", "active", "products"})
+    semantic["products"] = [
+        p.model_dump(exclude={"stock", "price", "unit"})
+        for p in sorted(source.products, key=lambda p: p.id)
+    ]
+    return semantic
+
+
+def profile_input(source: ClientInput, limit: int) -> ClientInput:
+    """Stable category round-robin, exact-text deduplication; no sales assumptions."""
+    grouped, seen = {}, set()
+    for product in sorted(source.products, key=lambda p: (p.category or "", p.id)):
+        if not product.active:
+            continue
+        # Operational fields never influence the generated semantic company profile.
+        product = product.model_copy(update={
+            "description": product.description[:500],
+            "price": None, "stock": None, "unit": None,
+        })
+        key = (product.name, product.description, product.category)
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(product.category or "", deque()).append(product)
+    sample = []
+    while grouped and len(sample) < limit:
+        for category in list(grouped):
+            sample.append(grouped[category].popleft())
+            if not grouped[category]:
+                del grouped[category]
+            if len(sample) >= limit:
+                break
+    return source.model_copy(update={
+        "products": sample, "region": None, "city": None, "active": True,
+    })
 
 
 class Indexer:
@@ -23,42 +64,21 @@ class Indexer:
             revision = fingerprint([
                 source.model_dump(), context_revision, self.settings.embedding_model,
                 self.settings.llm_model, self.settings.model_api_mode,
-                self.providers.embedding_base_url, self.providers.llm_base_url, "profile-v2-search",
+                self.providers.embedding_base_url, self.providers.llm_base_url,
+                PROFILE_VERSION, self.settings.profile_product_limit,
             ])
             previous = self.repository.client(source.id)
             if previous and previous.revision == revision:
                 return previous, False
-            # Stock, price, region changes should not spend another LLM call.
-            semantic = source.model_dump(exclude={"region", "city", "active", "products"})
-            semantic["products"] = [
-                p.model_dump(exclude={"stock", "price", "active", "unit"})
-                for p in sorted(source.products, key=lambda p: p.id)
-            ]
+            # Cache the actual bounded LLM input, not all unsampled catalog text.
+            prompt_source = profile_input(source, self.settings.profile_product_limit)
             profile_revision = fingerprint([
-                semantic, self.settings.llm_model, self.settings.model_api_mode,
-                self.providers.llm_base_url, "profile-v2-search",
+                prompt_source.model_dump(), self.settings.llm_model, self.settings.model_api_mode,
+                self.providers.llm_base_url, PROFILE_VERSION,
             ])
             if previous and previous.profile_revision == profile_revision:
                 profile = previous.profile
             else:
-                # Deterministic, category-diverse sample bounds the LLM prompt.
-                ordered = sorted(source.products, key=lambda p: (p.category or "", p.id))
-                grouped: dict[str, list] = {}
-                for product in ordered:
-                    grouped.setdefault(product.category or "", []).append(product)
-                sample = []
-                while grouped and len(sample) < self.settings.profile_product_limit:
-                    for category in list(grouped):
-                        sample.append(grouped[category].pop(0))
-                        if not grouped[category]:
-                            del grouped[category]
-                        if len(sample) >= self.settings.profile_product_limit:
-                            break
-                prompt_source = source.model_copy(update={"products": sample})
-                # Keep a conservative character budget for the shared API.
-                prompt_source = prompt_source.model_copy(update={"products": [
-                    p.model_copy(update={"description": p.description[:500]}) for p in sample
-                ]})
                 profile = await self.providers.profile(prompt_source)
             specs = [("summary", profile.summary, None, None, 1.0)]
             specs += [("offer", text, None, None, 1.0) for text in profile.offers]
@@ -86,7 +106,8 @@ class Indexer:
             now = utcnow()
             content_updated_at = (
                 (previous.content_updated_at or previous.created_at)
-                if previous and previous.profile_revision == profile_revision else now
+                if previous and catalog_content(previous.source) == catalog_content(source)
+                and previous.profile_revision == profile_revision else now
             )
             indexed = IndexedClient(
                 source=source, profile=profile, documents=documents, revision=revision,

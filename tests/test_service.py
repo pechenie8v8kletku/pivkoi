@@ -65,6 +65,53 @@ def test_snapshot_cache_and_stock_update(service):
     assert not any(d.kind == "product" for d in app.state.repository.client("a").documents)
 
 
+def test_large_catalog_updates_only_refresh_changed_profile_input(service):
+    client, remote, app = service
+    products = [{"id": f"p{i:03}", "name": f"Product {i}",
+                 "category": "A", "stock": 5} for i in range(100)]
+    body = snapshot("large", products=products)
+    assert client.put("/v1/clients/large", json=body).status_code == 200
+    initial = app.state.repository.client("large")
+    assert remote.profile_calls == 1
+    assert len([d for d in initial.documents if d.kind == "product"]) == 100
+    products[-1]["description"] = "Changed outside the representative sample"
+    assert client.put("/v1/clients/large", json=body).status_code == 200
+    updated = app.state.repository.client("large")
+    assert remote.profile_calls == 1
+    assert updated.profile_revision == initial.profile_revision
+    assert updated.content_updated_at > initial.content_updated_at
+    assert any(d.product_id == "p099" and "Changed outside" in d.text
+               for d in updated.documents)
+    products[0]["name"] = "Changed representative product"
+    assert client.put("/v1/clients/large", json=body).status_code == 200
+    assert remote.profile_calls == 2
+    products[0]["active"] = False
+    assert client.put("/v1/clients/large", json=body).status_code == 200
+    assert remote.profile_calls == 3
+    assert not any(d.product_id == "p000"
+                   for d in app.state.repository.client("large").documents)
+
+
+def test_profile_sample_diversity_dedup_and_operational_stability():
+    from business_match.indexing import profile_input
+    from business_match.schemas import ClientInput
+
+    source = ClientInput.model_validate(snapshot("sample", products=[
+        {"id": "a1", "name": "Same", "category": "A", "price": 10, "stock": 2},
+        {"id": "a2", "name": "Same", "category": "A"},
+        {"id": "a3", "name": "Different", "category": "A"},
+        {"id": "b1", "name": "Rare category", "category": "B"},
+        {"id": "c1", "name": "Removed", "category": "C", "active": False},
+    ]))
+    before = profile_input(source, 3)
+    assert [p.id for p in before.products] == ["a1", "b1", "a3"]
+    source.products.reverse()
+    for p in source.products:
+        p.price, p.stock, p.unit = 999, 0, "new unit"
+    source.region = "New region"
+    assert profile_input(source, 3).model_dump() == before.model_dump()
+
+
 def test_feed_event_attribution_dedup_hide_and_search(service):
     client, _, app = service
     for key in ("a", "b", "c"):
