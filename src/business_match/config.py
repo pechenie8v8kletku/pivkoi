@@ -1,12 +1,12 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", allow_inf_nan=False)
 
     database_url: str = "sqlite:///./business_match.db"
     model_api_mode: Literal["mock", "external"] = "mock"
@@ -49,9 +49,50 @@ class Settings(BaseSettings):
     rerank_tpm: int = Field(default=60000, ge=1000)
     rerank_top_k: int = Field(default=12, ge=1, le=30)
     candidate_limit: int = Field(default=150, ge=10)
+    retrieval_client_batch_size: int = Field(default=128, ge=1, le=10000)
+    retrieval_document_batch_size: int = Field(default=1024, ge=1, le=50000)
+    retrieval_query_batch_size: int = Field(default=64, ge=1, le=1000)
+    query_importance_weight: float = Field(default=0.15, ge=0, le=1)
+    card_product_limit: int = Field(default=3, ge=0, le=20)
+    content_dimensions: int = Field(default=32, ge=4, le=128)
+    content_projection_seed: int = Field(default=42, ge=0)
+    catalog_size_scale: int = Field(default=20, ge=1)
+    ranker_max_observations: int = Field(default=1000, ge=1, le=100000)
+    reward_open: float = Field(default=0.55, ge=0, le=1)
+    reward_like: float = Field(default=0.8, ge=0, le=1)
+    reward_contact: float = Field(default=1.0, ge=0, le=1)
+    reward_hide: float = Field(default=0.0, ge=0, le=1)
+    reward_dwell_max: float = Field(default=0.35, ge=0, le=1)
+    dwell_min_ms: int = Field(default=2000, ge=0)
+    dwell_saturation_ms: int = Field(default=15000, gt=0)
+    baseline_ceiling: float = Field(default=0.8, gt=0, le=1)
+    baseline_slope: float = Field(default=4.0, gt=0)
+    baseline_midpoint: float = Field(default=0.5, ge=0, le=1)
+    feedback_history_days: int = Field(default=60, ge=1)
+    hide_duration_days: float = Field(default=7, gt=0)
+    impression_decay_days: float = Field(default=1, gt=0)
+    event_future_tolerance_seconds: int = Field(default=300, ge=0)
+    segment_repeat_weight: float = Field(default=0.25, ge=0)
+    graph_prior_rate: float = Field(default=0.12, ge=0, le=1)
+    graph_prior_strength: float = Field(default=20, gt=0)
+    graph_half_life_days: float = Field(default=60, gt=0)
+    graph_negative_weight: float = Field(default=2, ge=0)
+    graph_score_scale: float = Field(default=0.12, ge=0)
+    graph_reward_dwell: float = Field(default=0.12, ge=0, le=1)
+    graph_reward_open: float = Field(default=0.35, ge=0, le=1)
+    graph_reward_like: float = Field(default=0.65, ge=0, le=1)
+    graph_reward_contact: float = Field(default=1, ge=0, le=1)
     profile_product_limit: int = Field(default=40, ge=1, le=100)
     history_half_life_days: float = Field(default=14, gt=0)
     freshness_half_life_days: float = Field(default=14, gt=0)
+
+    @model_validator(mode="after")
+    def consistent_windows(self):
+        if self.hide_duration_days > self.feedback_history_days:
+            raise ValueError("feedback_history_days must cover hide_duration_days")
+        if self.dwell_min_ms > self.dwell_saturation_ms:
+            raise ValueError("dwell_min_ms must not exceed dwell_saturation_ms")
+        return self
 
 
 @lru_cache

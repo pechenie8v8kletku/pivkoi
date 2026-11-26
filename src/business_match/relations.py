@@ -5,18 +5,9 @@ import json
 import re
 from datetime import datetime
 
+from business_match.config import Settings
 from business_match.schemas import EventKind, FeedbackEvent, utcnow
 from business_match.storage import Repository, relation_edges, relation_observations
-
-PRIOR_RATE = 0.12
-PRIOR_STRENGTH = 20.0
-HALF_LIFE_DAYS = 60.0
-POSITIVE_REWARD = {
-    EventKind.dwell: 0.12,
-    EventKind.open: 0.35,
-    EventKind.like: 0.65,
-    EventKind.contact: 1.0,
-}
 
 
 def canonical_segment(value: str) -> str:
@@ -31,8 +22,9 @@ def stable_id(value: str) -> str:
 class RelationGraph:
     """Accumulates bounded edge evidence transactionally with the original event."""
 
-    def __init__(self, repository: Repository):
+    def __init__(self, repository: Repository, settings: Settings | None = None):
         self.repository = repository
+        self.settings = settings if settings is not None else Settings(_env_file=None)
 
     @staticmethod
     def edge_id(source_segment: str, target_segment: str, intent: str) -> str:
@@ -68,9 +60,10 @@ class RelationGraph:
             exposure_delta = 0.0
             positive_delta = negative_delta = 0.0
 
-        reward = POSITIVE_REWARD.get(event.kind, 0.0)
+        reward = {kind: getattr(self.settings, f"graph_reward_{kind}")
+                  for kind in ("dwell", "open", "like", "contact")}.get(event.kind, 0.0)
         if event.kind == EventKind.dwell:
-            reward *= min(event.dwell_ms / 15000, 1)
+            reward *= min(event.dwell_ms / self.settings.dwell_saturation_ms, 1)
         if reward > updated["positive"]:
             positive_delta = reward - updated["positive"]
             updated["positive"] = reward
@@ -96,7 +89,7 @@ class RelationGraph:
                 0.0,
                 (utcnow() - datetime.fromisoformat(edge["updated_at"])).total_seconds(),
             )
-            decay = 0.5 ** (elapsed / (HALF_LIFE_DAYS * 86400))
+            decay = 0.5 ** (elapsed / (self.settings.graph_half_life_days * 86400))
             edge["exposures"] = edge["exposures"] * decay + exposure_delta
             edge["positive"] = edge["positive"] * decay + positive_delta
             edge["negative"] = edge["negative"] * decay + negative_delta
@@ -112,14 +105,15 @@ class RelationGraph:
             0.0,
             (utcnow() - datetime.fromisoformat(edge["updated_at"])).total_seconds(),
         )
-        decay = 0.5 ** (elapsed / (HALF_LIFE_DAYS * 86400))
+        decay = 0.5 ** (elapsed / (self.settings.graph_half_life_days * 86400))
         exposures = edge["exposures"] * decay
         positive = edge["positive"] * decay
         negative = edge["negative"] * decay
         # Smoothed global response rate; impressions only provide denominator/support,
         # never a per-user negative preference update.
-        posterior = (PRIOR_RATE * PRIOR_STRENGTH + positive) / (
-            PRIOR_STRENGTH + exposures + 2 * negative
+        prior, strength = self.settings.graph_prior_rate, self.settings.graph_prior_strength
+        posterior = (prior * strength + positive) / (
+            strength + exposures + self.settings.graph_negative_weight * negative
         )
-        confidence = exposures / (exposures + PRIOR_STRENGTH)
-        return 0.12 * confidence * (posterior - PRIOR_RATE), True
+        confidence = exposures / (exposures + strength)
+        return self.settings.graph_score_scale * confidence * (posterior - prior), True

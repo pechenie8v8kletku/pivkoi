@@ -11,6 +11,29 @@ from business_match.schemas import Intent, utcnow
 from business_match.storage import Repository, ranker_states
 
 
+def test_configured_features_invalidate_incompatible_saved_training():
+    repo = Repository("sqlite:///:memory:")
+    repo.initialize()
+    settings = Settings(_env_file=None, content_dimensions=8, ranker_max_observations=2,
+                        linucb_alpha=0)
+    builder = FeatureBuilder(settings)
+    features = builder.build(semantic=0.6, rerank=0.5, graph=0, freshness=0.5,
+                             same_region=False, same_city=False, in_stock=True, catalog_size=2,
+                             seen=0, is_new=True, intent=Intent.supplier, content_vector=[1, 0])
+    ranker = LinUCBRanker(settings, repo)
+    assert len(features) == 14 + len(Intent) * 8
+    for i in range(3):
+        ranker.update("u", str(i), features, 1, utcnow(), terminal=True)
+    assert set(repo.get(ranker_states, "u")["observations"]) == {"1", "2"}
+    changed = settings.model_copy(update={"content_projection_seed": 7})
+    other = LinUCBRanker(changed, repo)
+    assert other.version != ranker.version
+    assert other.score(features, "u", "")[0] == other.score(features, "fresh", "")[0]
+    other.update("u", "new", features, 0, utcnow(), terminal=True)
+    assert set(repo.get(ranker_states, "u")["observations"]) == {"new"}
+    repo.close()
+
+
 def test_content_learning_is_personal_and_hide_overrides_contact():
     repo = Repository("sqlite:///:memory:")
     repo.initialize()

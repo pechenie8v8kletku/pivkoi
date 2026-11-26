@@ -3,6 +3,7 @@
 import math
 import random
 from datetime import datetime, timedelta
+from time import perf_counter
 from uuid import uuid4
 
 import numpy as np
@@ -10,7 +11,6 @@ import numpy as np
 from business_match.config import Settings
 from business_match.providers import Providers
 from business_match.ranking import (
-    EVENT_REWARDS,
     FeatureBuilder,
     ScoredCandidate,
     SlatePolicy,
@@ -18,8 +18,8 @@ from business_match.ranking import (
     observation_key,
 )
 from business_match.relations import RelationGraph
+from business_match.retrieval import CandidateRetriever, ExactRetriever
 from business_match.schemas import (
-    Document,
     FeedbackEvent,
     Intent,
     ProductMatch,
@@ -38,26 +38,32 @@ def similarity(a, b) -> float:
 
 
 class Engine:
-    def __init__(self, repository: Repository, providers: Providers, settings: Settings):
+    def __init__(self, repository: Repository, providers: Providers, settings: Settings,
+                 retriever: CandidateRetriever | None = None):
         self.repository, self.providers, self.settings = repository, providers, settings
-        self.relation_graph = RelationGraph(repository)
-        self.feature_builder = FeatureBuilder()
+        self.relation_graph = RelationGraph(repository, settings)
+        self.retriever = (retriever if retriever is not None
+                          else ExactRetriever(repository, settings))
+        self.feature_builder = FeatureBuilder(settings)
         self.ranker = create_ranker(settings, repository)
         self.slate_policy = SlatePolicy(settings)
 
     def feedback_state(self, client_id: str):
         seen, hidden = {}, set()
         now = utcnow()
-        for record in self.repository.user_events(client_id):
+        for record in self.repository.user_events(client_id, self.settings.feedback_history_days):
             age = max(0, (now - datetime.fromisoformat(record["received_at"])).total_seconds())
             target = record["event"]["target_client_id"]
             if record["event"]["kind"] == "impression":
-                seen[target] = max(seen.get(target, 0), math.exp(-age / 86400))
-            if record["event"]["kind"] == "hide" and age < 7 * 86400:
+                seen[target] = max(seen.get(target, 0), math.exp(
+                    -age / (self.settings.impression_decay_days * 86400)))
+            if (record["event"]["kind"] == "hide"
+                    and age < self.settings.hide_duration_days * 86400):
                 hidden.add(target)
         return seen, hidden
 
     async def recommend(self, request: RecommendRequest) -> RecommendationResponse:
+        started = perf_counter()
         viewer = self.repository.client(request.client_id)
         if viewer is None or not viewer.source.active:
             raise LookupError("Active viewer not found")
@@ -66,104 +72,55 @@ class Engine:
         query_vector = None
         if request.query:
             query_vector = (await self.providers.embed([request.query], query=True))[0]
-        candidates = []
+        pool = []
         graph_edges_used = 0
         graph_cache = {}
-        for target in self.repository.all_clients():
+        retrieval_started = perf_counter()
+        matches = self.retriever.retrieve(viewer, request, hidden, query_vector)
+        retrieval_ms = (perf_counter() - retrieval_started) * 1000
+        now = utcnow()
+        for match in matches:
+            target, intent = match.target, match.intent
             source = target.source
-            if (source.id == request.client_id or not source.active
-                    or source.id in request.exclude_client_ids or source.id in hidden):
-                continue
-            if request.region and source.region != request.region:
-                continue
-            if request.city and source.city != request.city:
-                continue
-            target_offers = [d for d in target.documents if d.kind in ("offer", "product")]
-            if not target_offers:
-                continue
-            channels = [request.intent] if request.intent else list(Intent)
-            for intent in channels:
-                if query_vector is not None:
-                    queries = [Document(key="search", text=request.query, kind="need",
-                                        vector=query_vector, intent=intent)]
-                    corpus = target_offers if intent != Intent.buyer else [
-                        d for d in target.documents
-                        if d.kind == "need" and d.intent == Intent.supplier
-                    ]
-                elif intent == Intent.buyer:
-                    queries = [d for d in viewer.documents if d.kind in ("offer", "product")]
-                    corpus = [d for d in target.documents
-                              if d.kind == "need" and d.intent == Intent.supplier]
-                elif intent == Intent.peer:
-                    queries = [d for d in viewer.documents if d.kind == "offer"]
-                    corpus = target_offers
-                else:
-                    queries = [d for d in viewer.documents
-                               if d.kind == "need" and d.intent == intent]
-                    corpus = target_offers
-                if not queries or not corpus:
-                    continue
-                best = None
-                for query in queries:
-                    q = query.vector
-                    for document in corpus:
-                        sim = (similarity(q, document.vector) + 1) / 2
-                        value = sim * (0.85 + 0.15 * query.weight)
-                        if best is None or value > best[0]:
-                            best = (value, query, document, q)
-                score, matched_query, matched, q = best
-                published_at = target.content_updated_at or target.created_at
-                age = max(0, (utcnow() - published_at).total_seconds() / 86400)
-                freshness = 0.5 ** (age / self.settings.freshness_half_life_days)
-                geo = bool(viewer.source.region and viewer.source.region == source.region)
-                graph_key = (viewer.source.segment, source.segment, intent.value)
-                if graph_key not in graph_cache:
-                    graph_cache[graph_key] = self.relation_graph.score(*graph_key)
-                graph_delta, graph_used = graph_cache[graph_key]
-                graph_edges_used += int(graph_used)
-                products = sorted(
-                    [ProductMatch(product=p, score=(similarity(q, d.vector) + 1) / 2)
-                     for p in source.products if p.active and p.stock != 0
-                     for d in target.documents if d.product_id == p.id],
-                    key=lambda p: p.score, reverse=True,
-                )[:3]
-                reason = {
-                    Intent.supplier: "Potential supplier for this need",
-                    Intent.buyer: "Potential buyer for your offer",
-                    Intent.partner: "Potential complementary business partner",
-                    Intent.peer: "Company with a similar offer",
-                }[intent]
-                candidates.append({
-                    "item": Recommendation(
-                        client_id=source.id, name=source.name, segment=source.segment,
-                        region=source.region, city=source.city, intent=intent, score=score,
-                        reason=reason, matched_need=matched_query.text, matched_text=matched.text,
-                        products=products,
-                    ),
-                    "vector": matched.vector, "query": q,
-                    "matched_query": matched_query.text,
-                    "matched_text": matched.text,
-                    "semantic": score,
-                    "freshness": freshness,
-                    "same_region": geo,
-                    "same_city": bool(viewer.source.city and viewer.source.city == source.city),
-                    "graph": graph_delta,
-                    "graph_known": graph_used,
-                    "seen": seen.get(source.id, 0),
-                    "is_new": source.id not in seen,
-                    "in_stock": bool(products),
-                    "catalog_size": len(source.products),
-                })
-        candidates.sort(key=lambda c: c["semantic"], reverse=True)
-        # Keep a candidate-generation budget per intent, separate from ranking.
-        pool = []
-        for intent in Intent:
-            channel = [c for c in candidates if c["item"].intent == intent]
-            if channel:
-                # Diversity/exploration operate within plausible matches, not the whole catalog.
-                minimum = channel[0]["semantic"] - self.settings.retrieval_score_tolerance
-                pool.extend([c for c in channel if c["semantic"] >= minimum]
-                            [:self.settings.candidate_limit])
+            matched_query, matched = match.query, match.document
+            q, score = matched_query.vector, match.semantic
+            published_at = target.content_updated_at or target.created_at
+            age = max(0, (now - published_at).total_seconds() / 86400)
+            freshness = 0.5 ** (age / self.settings.freshness_half_life_days)
+            geo = bool(viewer.source.region and viewer.source.region == source.region)
+            graph_key = (viewer.source.segment, source.segment, intent.value)
+            if graph_key not in graph_cache:
+                graph_cache[graph_key] = self.relation_graph.score(*graph_key)
+            graph_delta, graph_used = graph_cache[graph_key]
+            graph_edges_used += int(graph_used)
+            by_id = {p.id: p for p in source.products if p.active and p.stock != 0}
+            products = sorted(
+                [ProductMatch(product=by_id[d.product_id],
+                              score=(similarity(q, d.vector) + 1) / 2)
+                 for d in target.documents if d.product_id in by_id],
+                key=lambda p: p.score, reverse=True,
+            )[:self.settings.card_product_limit]
+            reason = {
+                Intent.supplier: "Potential supplier for this need",
+                Intent.buyer: "Potential buyer for your offer",
+                Intent.partner: "Potential complementary business partner",
+                Intent.peer: "Company with a similar offer",
+            }[intent]
+            pool.append({
+                "item": Recommendation(
+                    client_id=source.id, name=source.name, segment=source.segment,
+                    region=source.region, city=source.city, intent=intent, score=score,
+                    reason=reason, matched_need=matched_query.text, matched_text=matched.text,
+                    products=products,
+                ),
+                "vector": matched.vector, "query": q,
+                "matched_query": matched_query.text, "matched_text": matched.text,
+                "semantic": score, "freshness": freshness, "same_region": geo,
+                "same_city": bool(viewer.source.city and viewer.source.city == source.city),
+                "graph": graph_delta, "graph_known": graph_used,
+                "seen": seen.get(source.id, 0), "is_new": source.id not in seen,
+                "in_stock": bool(products), "catalog_size": len(source.products),
+            })
 
         # Cross-encoder scores the exact need/offer (or query/offer) pair, including feed.
         reranked = False
@@ -175,6 +132,7 @@ class Engine:
             if use_reranker else []
         )
         rerank_scores = None
+        rerank_started = perf_counter()
         if rerank_candidates:
             pairs = [(c["matched_query"][:1000], c["matched_text"][:1500])
                      for c in rerank_candidates]
@@ -191,6 +149,8 @@ class Engine:
                 for index, candidate in enumerate(rerank_candidates):
                     candidate["rerank"] = ranks[index]
                 reranked = True
+        rerank_ms = (perf_counter() - rerank_started) * 1000
+        ranking_started = perf_counter()
         prepared = []
         self.ranker.prepare(request.client_id)
         for candidate in pool:
@@ -213,6 +173,8 @@ class Engine:
                 semantic=candidate["semantic"],
                 novelty=max(candidate["freshness"], 1 - candidate["seen"]),
             ))
+        ranking_ms = (perf_counter() - ranking_started) * 1000
+        slate_started = perf_counter()
         selected = self.slate_policy.select(
             prepared, request.limit, rng, enable_exploration=not bool(request.query)
         )
@@ -225,7 +187,11 @@ class Engine:
                          "eligible_clients": len({c.item.client_id for c in prepared}),
                          "graph_edges_used": graph_edges_used,
                          "ranker_observations": len(ranker_payload.get("observations", {})),
-                         "ranker_mode": self.settings.ranker_mode},
+                          "ranker_mode": self.settings.ranker_mode,
+                          "retrieval_backend": type(self.retriever).__name__,
+                          "retrieval_ms": retrieval_ms, "rerank_ms": rerank_ms,
+                          "ranking_ms": ranking_ms,
+                          "slate_ms": (perf_counter() - slate_started) * 1000},
         )
         self.repository.put(slates, request_id, {
             "created_at": utcnow().isoformat(), "mode": response.mode,
@@ -243,6 +209,7 @@ class Engine:
             "client_id": request.client_id,
             "source_segment": viewer.source.segment,
         }, client_id=request.client_id)
+        response.diagnostics["engine_total_ms"] = (perf_counter() - started) * 1000
         return response
 
     def ingest(self, event: FeedbackEvent) -> bool:
@@ -257,7 +224,9 @@ class Engine:
             raise ValueError("Target was not included in this slate")
         if event.product_id and event.product_id not in matched["product_ids"]:
             raise ValueError("Product was not included in this card")
-        if event.occurred_at > utcnow() + timedelta(minutes=5):
+        if event.occurred_at > utcnow() + timedelta(
+            seconds=self.settings.event_future_tolerance_seconds
+        ):
             raise ValueError("Event timestamp is in the future")
         if event.occurred_at < datetime.fromisoformat(slate["created_at"]):
             raise ValueError("Event predates recommendation request")
@@ -271,10 +240,12 @@ class Engine:
             inserted = self.repository.insert_event(event.event_id, event.client_id, payload, conn)
             if inserted:
                 self.relation_graph.record(event, slate, matched, conn)
-                reward = EVENT_REWARDS.get(event.kind.value)
+                reward = {kind: getattr(self.settings, f"reward_{kind}")
+                          for kind in ("open", "like", "contact", "hide")}.get(event.kind.value)
                 if event.kind.value == "dwell":
-                    reward = (min(0.35, 0.35 * event.dwell_ms / 15000)
-                              if event.dwell_ms >= 2000 else None)
+                    reward = (self.settings.reward_dwell_max * min(
+                        1, event.dwell_ms / self.settings.dwell_saturation_ms)
+                        if event.dwell_ms >= self.settings.dwell_min_ms else None)
                 if reward is not None:
                     self.ranker.update(
                         event.client_id,

@@ -98,6 +98,24 @@ class Repository:
                 for p in conn.execute(select(clients.c.payload)).scalars()
             ]
 
+    def iter_client_batches(self, batch_size: int, *, region=None, city=None):
+        """Keyset pagination: bound decoded catalog memory; no OFFSET or long read transaction."""
+        last_id = None
+        while True:
+            stmt = select(clients.c.id, clients.c.payload).order_by(clients.c.id).limit(batch_size)
+            if last_id is not None:
+                stmt = stmt.where(clients.c.id > last_id)
+            if region is not None:
+                stmt = stmt.where(clients.c.payload["source"]["region"].as_string() == region)
+            if city is not None:
+                stmt = stmt.where(clients.c.payload["source"]["city"].as_string() == city)
+            with self.engine.connect() as conn:
+                rows = conn.execute(stmt).all()
+            if not rows:
+                return
+            last_id = rows[-1][0]
+            yield [IndexedClient.model_validate(payload) for _, payload in rows]
+
     def client(self, key: str) -> IndexedClient | None:
         payload = self.get(clients, key)
         return IndexedClient.model_validate(payload) if payload else None
@@ -106,7 +124,10 @@ class Repository:
         cutoff = (utcnow() - timedelta(days=days)).isoformat()
         with self.engine.connect() as conn:
             values = conn.execute(
-                select(events.c.payload).where(events.c.client_id == client_id)
+                select(events.c.payload).where(
+                    events.c.client_id == client_id,
+                    events.c.payload["received_at"].as_string() >= cutoff,
+                )
             ).scalars()
             return [p for p in values if p["received_at"] >= cutoff]
 

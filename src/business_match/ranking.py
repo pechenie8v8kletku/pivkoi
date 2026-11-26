@@ -7,35 +7,55 @@ from functools import lru_cache
 import numpy as np
 
 from business_match.config import Settings
+from business_match.providers import fingerprint
 from business_match.schemas import Intent, utcnow
 from business_match.storage import Repository, ranker_states
 
-CONTENT_DIMENSIONS = 32
-FEATURE_NAMES = (
+METADATA_FEATURE_NAMES = (
     "semantic", "rerank", "graph", "freshness", "same_region", "same_city",
     "in_stock", "catalog_size", "seen", "new_candidate",
     "intent_supplier", "intent_buyer", "intent_partner", "intent_peer",
-) + tuple(f"content_{intent.value}_{i}" for intent in Intent
-          for i in range(CONTENT_DIMENSIONS))
-EVENT_REWARDS = {
-    "open": 0.55,
-    "like": 0.8,
-    "contact": 1.0,
-    "hide": 0.0,
-}
+)
+
+
+def feature_names(settings: Settings):
+    return METADATA_FEATURE_NAMES + tuple(
+        f"content_{intent.value}_{i}" for intent in Intent
+        for i in range(settings.content_dimensions))
+
+
+def training_signature(settings: Settings):
+    """Prevent silently interpreting saved observations under a different feature/provider setup."""
+    fields = (
+        "content_dimensions", "content_projection_seed", "catalog_size_scale",
+        "personal_metadata_scale", "model_api_mode", "embedding_model",
+        "llm_model", "query_importance_weight",
+        "baseline_ceiling", "baseline_slope", "baseline_midpoint",
+        "reward_open", "reward_like", "reward_contact", "reward_hide",
+        "reward_dwell_max", "dwell_min_ms", "dwell_saturation_ms",
+        "ranker_rerank_weight", "ranker_graph_weight",
+        "ranker_freshness_weight", "ranker_region_weight",
+    )
+    values = {field: getattr(settings, field) for field in fields}
+    values["provider"] = (settings.mock_api_base_url if settings.model_api_mode == "mock"
+                          else settings.embedding_base_url)
+    values["features"] = feature_names(settings)
+    return fingerprint(values)[:16]
 
 
 @lru_cache(maxsize=8)
-def content_projection(dimensions: int):
-    return np.random.default_rng(42).standard_normal(
-        (CONTENT_DIMENSIONS, dimensions)
-    ) / np.sqrt(CONTENT_DIMENSIONS)
+def content_projection(dimensions: int, output_dimensions: int, seed: int):
+    projection = np.random.default_rng(seed).standard_normal(
+        (output_dimensions, dimensions)
+    ) / np.sqrt(output_dimensions)
+    projection.setflags(write=False)
+    return projection
 
 
 def personal_features(features, metadata_scale):
     """Keep shared relevance/quality metadata in the prior, learn personal content taste."""
     values = np.asarray(features, dtype=float).copy()
-    values[:14] *= metadata_scale
+    values[:len(METADATA_FEATURE_NAMES)] *= metadata_scale
     return values
 
 
@@ -52,28 +72,34 @@ class ScoredCandidate:
 
 
 class FeatureBuilder:
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings if settings is not None else Settings(_env_file=None)
+
     def build(self, *, semantic: float, rerank: float, graph: float, freshness: float,
               same_region: bool, same_city: bool, in_stock: bool, catalog_size: int,
               seen: float, is_new: bool, intent: Intent,
               content_vector: list[float] | None = None) -> list[float]:
         values = [
             semantic, rerank, graph, freshness, float(same_region), float(same_city),
-            float(in_stock), min(1.0, np.log1p(catalog_size) / np.log(21)),
+            float(in_stock), min(1.0, np.log1p(catalog_size)
+                                 / np.log1p(self.settings.catalog_size_scale)),
             seen, float(is_new),
         ]
         values.extend(float(intent == channel) for channel in Intent)
         # Stable random projection: let the personal model distinguish flour from packaging,
         # even if their scalar semantic scores and other metadata are identical.
-        content = np.zeros(CONTENT_DIMENSIONS)
+        dimensions = self.settings.content_dimensions
+        content = np.zeros(dimensions)
         if content_vector:
-            projection = content_projection(len(content_vector))
+            projection = content_projection(
+                len(content_vector), dimensions, self.settings.content_projection_seed)
             content = projection @ np.asarray(content_vector)
             norm = np.linalg.norm(content)
             if norm:
                 content /= norm
         # Buying equipment must not teach the model to seek equipment vendors as buyers.
         for channel in Intent:
-            values.extend(content.tolist() if channel == intent else [0.0] * CONTENT_DIMENSIONS)
+            values.extend(content.tolist() if channel == intent else [0.0] * dimensions)
         return values
 
 
@@ -105,10 +131,11 @@ class SemanticRanker:
 class LinUCBRanker(SemanticRanker):
     """Personal residual linear UCB, with a semantic cold-start prior."""
 
-    version = "personal-linear-ucb-v4-directed-content32"
+    version = "personal-linear-ucb-v5"
 
     def __init__(self, settings: Settings, repository: Repository):
         super().__init__(settings)
+        self.version = f"personal-linear-ucb-v5-{training_signature(settings)}"
         self.repository = repository
         self._request_model = None
 
@@ -118,7 +145,7 @@ class LinUCBRanker(SemanticRanker):
         if payload and payload.get("version") != self.version:
             payload = None
         observations = (payload or {}).get("observations", {})
-        dimension = len(FEATURE_NAMES)
+        dimension = len(feature_names(self.settings))
         matrix = self.settings.linucb_regularization * np.eye(dimension)
         target = np.zeros(dimension)
         now = utcnow()
@@ -135,15 +162,16 @@ class LinUCBRanker(SemanticRanker):
             decay = 0.5 ** (age / (86400 * self.settings.history_half_life_days))
             matrix += decay * np.outer(features, features)
             target += decay * features * observation["residual"]
-        self._request_model = (client_id, np.linalg.inv(matrix), target)
+        inverse = np.linalg.inv(matrix)
+        self._request_model = (client_id, inverse, inverse @ target)
 
     def score(self, features: list[float], client_id: str, key: str):
         prior, _ = super().score(features, client_id, key)
         if self._request_model is None or self._request_model[0] != client_id:
             self.prepare(client_id)
-        _, inverse, target = self._request_model
+        _, inverse, theta = self._request_model
         x = personal_features(features, self.settings.personal_metadata_scale)
-        personal_residual = float(x @ inverse @ target)
+        personal_residual = float(x @ theta)
         uncertainty = float(np.sqrt(max(0.0, x @ inverse @ x)))
         # Do not treat the raw retrieval score as a probability or as a click.
         score = prior + self.settings.ranker_personal_weight * personal_residual
@@ -171,7 +199,8 @@ class LinUCBRanker(SemanticRanker):
             features = previous["features"]
         else:
             prior, _ = super().score(features, client_id, key)
-            baseline = float(0.8 / (1 + np.exp(-4 * (prior - 0.5))))
+            logit = self.settings.baseline_slope * (prior - self.settings.baseline_midpoint)
+            baseline = float(self.settings.baseline_ceiling * np.exp(-np.logaddexp(0, -logit)))
         observations[key] = {
             "features": features,
             "reward": reward,
@@ -181,9 +210,9 @@ class LinUCBRanker(SemanticRanker):
             "terminal": terminal,
         }
         # Keep online state bounded; raw event log remains the retraining source.
-        if len(observations) > 1000:
+        if len(observations) > self.settings.ranker_max_observations:
             ordered = sorted(observations, key=lambda k: observations[k]["occurred_at"])
-            for expired in ordered[:len(observations) - 1000]:
+            for expired in ordered[:len(observations) - self.settings.ranker_max_observations]:
                 del observations[expired]
         payload["observations"] = observations
         payload["version"] = self.version
@@ -208,9 +237,8 @@ class SlatePolicy:
         pool = list(candidates)
         if not pool:
             return []
-        # Precompute once rather than doing Python dot products for every previous slot.
+        # One matrix-vector update per chosen slot: O(candidates * dimensions) memory.
         vectors = np.asarray([c.vector for c in pool])
-        similarities = (vectors @ vectors.T + 1) / 2
         indices = {id(c): i for i, c in enumerate(pool)}
         redundancy_scores = np.zeros(len(pool))
         segment_counts = {}
@@ -242,7 +270,8 @@ class SlatePolicy:
                 redundancy = redundancy_scores[indices[id(candidate)]]
                 repeats = segment_counts.get(candidate.item.segment, 0)
                 return (candidate.item.score - self.settings.diversity_weight * redundancy
-                        - self.settings.diversity_weight * 0.25 * repeats / max(1, limit))
+                        - self.settings.diversity_weight * self.settings.segment_repeat_weight
+                        * repeats / max(1, limit))
 
             greedy_choice = max(available, key=utility)
             epsilon = self.settings.exploration_rate if enable_exploration else 0.0
@@ -264,7 +293,7 @@ class SlatePolicy:
             selected.append(choice)
             used.add(choice.item.client_id)
             redundancy_scores = np.maximum(
-                redundancy_scores, similarities[:, indices[id(choice)]]
+                redundancy_scores, (vectors @ vectors[indices[id(choice)]] + 1) / 2
             )
             segment_counts[choice.item.segment] = segment_counts.get(choice.item.segment, 0) + 1
             role_counts[choice.item.intent] = role_counts.get(choice.item.intent, 0) + 1
