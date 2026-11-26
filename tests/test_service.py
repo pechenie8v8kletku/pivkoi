@@ -130,7 +130,7 @@ def test_ranker_learns_from_events_and_config_can_disable_it(service):
     disabled.prepare("a")
     linucb.prepare("a")
     assert disabled.version == "semantic-v1"
-    assert linucb.version == "personal-linear-ucb-v2-content32"
+    assert linucb.version == "personal-linear-ucb-v3-content32"
 
 
 def test_api_key():

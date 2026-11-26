@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     linucb_regularization: float = Field(default=1.0, gt=0)
     linucb_alpha: float = Field(default=0.15, ge=0)
     ranker_personal_weight: float = Field(default=0.5, ge=0)
+    personal_metadata_scale: float = Field(default=0.1, ge=0, le=1)
     ranker_rerank_weight: float = Field(default=0.35, ge=0, le=1)
     ranker_graph_weight: float = Field(default=0.1, ge=0)
     ranker_freshness_weight: float = Field(default=0.03, ge=0)

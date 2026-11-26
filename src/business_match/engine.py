@@ -68,6 +68,7 @@ class Engine:
             query_vector = (await self.providers.embed([request.query], query=True))[0]
         candidates = []
         graph_edges_used = 0
+        graph_cache = {}
         for target in self.repository.all_clients():
             source = target.source
             if (source.id == request.client_id or not source.active
@@ -115,9 +116,10 @@ class Engine:
                 age = max(0, (utcnow() - published_at).total_seconds() / 86400)
                 freshness = 0.5 ** (age / self.settings.freshness_half_life_days)
                 geo = bool(viewer.source.region and viewer.source.region == source.region)
-                graph_delta, graph_used = self.relation_graph.score(
-                    viewer.source.segment, source.segment, intent.value
-                )
+                graph_key = (viewer.source.segment, source.segment, intent.value)
+                if graph_key not in graph_cache:
+                    graph_cache[graph_key] = self.relation_graph.score(*graph_key)
+                graph_delta, graph_used = graph_cache[graph_key]
                 graph_edges_used += int(graph_used)
                 products = sorted(
                     [ProductMatch(product=p, score=(similarity(q, d.vector) + 1) / 2)

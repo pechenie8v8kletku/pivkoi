@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 
 import numpy as np
 
@@ -21,6 +22,20 @@ EVENT_REWARDS = {
     "contact": 1.0,
     "hide": 0.0,
 }
+
+
+@lru_cache(maxsize=8)
+def content_projection(dimensions: int):
+    return np.random.default_rng(42).standard_normal(
+        (CONTENT_DIMENSIONS, dimensions)
+    ) / np.sqrt(CONTENT_DIMENSIONS)
+
+
+def personal_features(features, metadata_scale):
+    """Keep shared relevance/quality metadata in the prior, learn personal content taste."""
+    values = np.asarray(features, dtype=float).copy()
+    values[:len(FEATURE_NAMES) - CONTENT_DIMENSIONS] *= metadata_scale
+    return values
 
 
 @dataclass
@@ -50,9 +65,7 @@ class FeatureBuilder:
         # even if their scalar semantic scores and other metadata are identical.
         content = np.zeros(CONTENT_DIMENSIONS)
         if content_vector:
-            projection = np.random.default_rng(42).standard_normal(
-                (CONTENT_DIMENSIONS, len(content_vector))
-            ) / np.sqrt(CONTENT_DIMENSIONS)
+            projection = content_projection(len(content_vector))
             content = projection @ np.asarray(content_vector)
             norm = np.linalg.norm(content)
             if norm:
@@ -89,7 +102,7 @@ class SemanticRanker:
 class LinUCBRanker(SemanticRanker):
     """Hybrid contextual linear bandit, with semantic score as the cold-start prior."""
 
-    version = "personal-linear-ucb-v2-content32"
+    version = "personal-linear-ucb-v3-content32"
 
     def __init__(self, settings: Settings, repository: Repository):
         super().__init__(settings)
@@ -107,7 +120,9 @@ class LinUCBRanker(SemanticRanker):
         target = np.zeros(dimension)
         now = utcnow()
         for observation in observations.values():
-            features = np.asarray(observation["features"], dtype=float)
+            features = personal_features(
+                observation["features"], self.settings.personal_metadata_scale
+            )
             if features.shape != (dimension,):
                 continue
             age = max(
@@ -124,7 +139,7 @@ class LinUCBRanker(SemanticRanker):
         if self._request_model is None or self._request_model[0] != client_id:
             self.prepare(client_id)
         _, inverse, target = self._request_model
-        x = np.asarray(features, dtype=float)
+        x = personal_features(features, self.settings.personal_metadata_scale)
         personal_residual = float(x @ inverse @ target)
         uncertainty = float(np.sqrt(max(0.0, x @ inverse @ x)))
         # Do not treat the raw retrieval score as a probability or as a click.
@@ -188,6 +203,14 @@ class SlatePolicy:
     def select(self, candidates: list[ScoredCandidate], limit: int, rng,
                enable_exploration: bool = True) -> list[ScoredCandidate]:
         pool = list(candidates)
+        if not pool:
+            return []
+        # Precompute once rather than doing Python dot products for every previous slot.
+        vectors = np.asarray([c.vector for c in pool])
+        similarities = (vectors @ vectors.T + 1) / 2
+        indices = {id(c): i for i, c in enumerate(pool)}
+        redundancy_scores = np.zeros(len(pool))
+        segment_counts = {}
         selected: list[ScoredCandidate] = []
         used = set()
         while pool and len(selected) < limit:
@@ -196,14 +219,11 @@ class SlatePolicy:
             if not available:
                 break
 
-            def utility(candidate):
-                redundancy = max((
-                    (float(np.dot(candidate.vector, other.vector)) + 1) / 2
-                    for other in selected
-                ), default=0)
-                repeats = sum(other.item.segment == candidate.item.segment for other in selected)
+            def utility(candidate, redundancy_scores=redundancy_scores):
+                redundancy = redundancy_scores[indices[id(candidate)]]
+                repeats = segment_counts.get(candidate.item.segment, 0)
                 return (candidate.item.score - self.settings.diversity_weight * redundancy
-                        - self.settings.diversity_weight * 0.25 * repeats)
+                        - self.settings.diversity_weight * 0.25 * repeats / max(1, limit))
 
             greedy_choice = max(available, key=utility)
             epsilon = self.settings.exploration_rate if enable_exploration else 0.0
@@ -224,6 +244,10 @@ class SlatePolicy:
             choice.item.exploration = random_branch
             selected.append(choice)
             used.add(choice.item.client_id)
+            redundancy_scores = np.maximum(
+                redundancy_scores, similarities[:, indices[id(choice)]]
+            )
+            segment_counts[choice.item.segment] = segment_counts.get(choice.item.segment, 0) + 1
         return selected
 
 
