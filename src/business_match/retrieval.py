@@ -8,6 +8,7 @@ import numpy as np
 
 from business_match.business_signals import support
 from business_match.config import Settings
+from business_match.interests import interests
 from business_match.schemas import Document, IndexedClient, Intent, RecommendRequest, utcnow
 from business_match.storage import Repository
 
@@ -20,6 +21,7 @@ class CandidateMatch:
     document: Document
     semantic: float
     evidence_support: float = 0.0
+    behavioral: bool = False
 
 
 class CandidateRetriever(Protocol):
@@ -38,6 +40,11 @@ class ExactRetriever:
         self.repository, self.settings = repository, settings
 
     def retrieve(self, viewer, request, hidden, query_vector):
+        learned = (interests(self.repository, self.settings, request.client_id, hidden)
+                   if query_vector is None and self.settings.interest_retrieval_enabled else {})
+        return self._retrieve(viewer, request, hidden, query_vector, learned)
+
+    def _retrieve(self, viewer, request, hidden, query_vector, learned=None):
         now = utcnow()
         def usable(document):
             return not document.evidence or support(document, self.settings, now) > 0
@@ -58,6 +65,12 @@ class ExactRetriever:
                     and not (intent == Intent.peer and d.evidence)]
             if docs:
                 queries[intent] = docs
+        # Independent bounded pools prevent a strong profile topic from filtering
+        # out learned interests. All pools share one paginated catalog scan.
+        for intent, docs in (learned or {}).items():
+            if intent in channels:
+                for doc in docs:
+                    queries[(intent, doc.key)] = [doc]
         heaps = {intent: [] for intent in queries}
         if not queries:
             return []
@@ -67,11 +80,14 @@ class ExactRetriever:
             self.settings.retrieval_client_batch_size, region=request.region, city=request.city
         ):
             targets = [t for t in batch if t.source.active and t.source.id not in excluded]
-            for intent, query_docs in queries.items():
+            for channel, query_docs in queries.items():
+                behavioral = isinstance(channel, tuple)
+                intent = channel[0] if behavioral else channel
                 best = {}
                 block = []
 
-                def score_block(block=block, query_docs=query_docs, best=best, intent=intent):
+                def score_block(block=block, query_docs=query_docs, best=best, intent=intent,
+                                behavioral=behavioral):
                     if not block:
                         return
                     vectors = np.asarray([d.vector for _, d in block], dtype=float)
@@ -104,7 +120,8 @@ class ExactRetriever:
                                     or (score == old[0] and order < old[1])):
                                 best[target.source.id] = (score, order, CandidateMatch(
                                     target, intent, qdocs[qi], document,
-                                    float(scores[qi, column]), float(evidence[qi, column])))
+                                    float(scores[qi, column]), float(evidence[qi, column]),
+                                    behavioral))
                     block.clear()
 
                 for target in targets:
@@ -119,11 +136,13 @@ class ExactRetriever:
                             if len(block) >= self.settings.retrieval_document_batch_size:
                                 score_block()
                 score_block()
-                heap = heaps[intent]
+                heap = heaps[channel]
+                limit = (self.settings.interest_candidates_per_vector if behavioral
+                         else self.settings.candidate_limit)
                 for score, _, match in best.values():
                     sequence += 1
                     entry = (score, -sequence, match)
-                    if len(heap) < self.settings.candidate_limit:
+                    if len(heap) < limit:
                         heapq.heappush(heap, entry)
                     elif entry[:2] > heap[0][:2]:
                         heapq.heapreplace(heap, entry)
@@ -133,4 +152,12 @@ class ExactRetriever:
                 ordered = sorted(heap, key=lambda entry: entry[:2], reverse=True)
                 threshold = ordered[0][0] - self.settings.retrieval_score_tolerance
                 result.extend(match for score, _, match in ordered if score >= threshold)
-        return result
+        merged = {}
+        for match in result:
+            key = (match.target.source.id, match.intent)
+            old = merged.get(key)
+            if old is None or (match.semantic + self.settings.business_signal_boost
+                               * match.evidence_support > old.semantic
+                               + self.settings.business_signal_boost * old.evidence_support):
+                merged[key] = match
+        return list(merged.values())

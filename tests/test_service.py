@@ -253,3 +253,46 @@ def test_card_keeps_relevant_products_without_catalog_padding(service):
     assert len(response.json()["items"]) == 1
     products = response.json()["items"][0]["products"]
     assert [p["product"]["id"] for p in products] == ["relevant"]
+
+
+def test_http_feedback_expands_feed_without_changing_explicit_search(service):
+    from business_match.interests import interests
+
+    client, remote, app = service
+    repo = app.state.repository
+    for key in ('viewer', 'old', 'clicked', 'new', 'other'):
+        assert client.put('/v1/clients/'+key, json=snapshot(key)).status_code == 200
+        entity = repo.client(key)
+        entity.documents = [Document(key='d', text=key+' topic',
+            kind='need' if key in ('viewer', 'other') else 'product',
+            intent='supplier' if key in ('viewer', 'other') else None,
+            product_id=None if key in ('viewer', 'other') else 'p',
+            vector=[1., 0.] if key in ('viewer', 'other', 'old') else [0., 1.])]
+        repo.put(clients, key, entity.model_dump(mode='json'))
+
+    async def embed(texts, query=False):
+        return [[0., 1.] for _ in texts]
+
+    remote.embed = embed
+    body = {'client_id': 'viewer', 'intent': 'supplier', 'limit': 10, 'seed': 42}
+    before = client.post('/v1/feed', json=body).json()
+    assert {x['client_id'] for x in before['items']} == {'old'}
+    search_body = {**body, 'query': 'new task'}
+    search = client.post('/v1/search', json=search_body).json()
+    event = {'event_id': 'personal-contact', 'request_id': search['request_id'],
+             'client_id': 'viewer', 'target_client_id': 'clicked',
+             'product_id': 'p', 'kind': 'contact'}
+    result = client.post('/v1/events', json={'events': [event, event]})
+    assert [x['status'] for x in result.json()['results']] == ['accepted', 'duplicate']
+    after = client.post('/v1/feed', json=body).json()
+    assert {x['client_id'] for x in after['items']} == {'old', 'clicked', 'new'}
+    assert after['diagnostics']['interest_candidates'] == 2
+    other = client.post('/v1/feed', json={**body, 'client_id':'other'}).json()
+    assert {x['client_id'] for x in other['items']} == {'old'}
+    searched = client.post('/v1/search', json=search_body).json()
+    assert {x['client_id'] for x in searched['items']} == {x['client_id'] for x in search['items']}
+    assert len(interests(repo, app.state.engine.settings, 'viewer', set())['supplier']) == 1
+    hide = {**event, 'event_id': 'hide-contact', 'request_id': after['request_id'], 'kind':'hide'}
+    hidden_result = client.post('/v1/events', json={'events':[hide]}).json()
+    assert hidden_result['results'][0]['status'] == 'accepted'
+    assert {x['client_id'] for x in client.post('/v1/feed', json=body).json()['items']} == {'old'}

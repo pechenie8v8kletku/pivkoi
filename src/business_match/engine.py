@@ -9,6 +9,7 @@ from uuid import uuid4
 import numpy as np
 
 from business_match.config import Settings
+from business_match.interests import embedding_signature
 from business_match.providers import Providers
 from business_match.ranking import (
     FeatureBuilder,
@@ -77,6 +78,7 @@ class Engine:
         graph_cache = {}
         retrieval_started = perf_counter()
         matches = self.retriever.retrieve(viewer, request, hidden, query_vector)
+        interest_candidates = sum(m.behavioral for m in matches)
         retrieval_ms = (perf_counter() - retrieval_started) * 1000
         now = utcnow()
         for match in matches:
@@ -110,6 +112,8 @@ class Engine:
                 Intent.partner: "Возможный партнёр с дополняющим предложением",
                 Intent.peer: "Компания с похожим предложением",
             }[intent]
+            if match.behavioral:
+                reason = "Похожее предложение по вашим лайкам и контактам"
             pool.append({
                 "item": Recommendation(
                     client_id=source.id, name=source.name, segment=source.segment,
@@ -131,6 +135,14 @@ class Engine:
                 "seen": seen.get(source.id, 0), "is_new": source.id not in seen,
                 "in_stock": bool(products), "catalog_size": len(source.products),
                 "evidence_support": match.evidence_support,
+                "interest_anchor": ({"text": matched.text, "vector": matched.vector,
+                                     "product_id": matched.product_id,
+                                     "signature": embedding_signature(self.settings)}
+                                    if not matched.evidence else None),
+                "product_anchors": {d.product_id: {"text": d.text, "vector": d.vector,
+                    "product_id": d.product_id, "signature": embedding_signature(self.settings)}
+                    for d in target.documents if not d.evidence
+                    and d.product_id in {p.product.id for p in products}},
             })
 
         # Cross-encoder scores the exact need/offer (or query/offer) pair, including feed.
@@ -206,6 +218,8 @@ class Engine:
                           "ranking_ms": ranking_ms,
                           "slate_ms": (perf_counter() - slate_started) * 1000},
         )
+        anchors = {(c['item'].client_id, c['item'].intent): c for c in pool}
+        response.diagnostics['interest_candidates'] = interest_candidates
         self.repository.put(slates, request_id, {
             "created_at": utcnow().isoformat(), "mode": response.mode,
             "policy_version": response.policy_version,
@@ -218,6 +232,10 @@ class Engine:
                        "semantic_score": c.semantic,
                        "product_ids": [p.product.id for p in c.item.products],
                        "exploration": c.item.exploration,
+                       "interest_anchor": anchors[c.item.client_id, c.item.intent][
+                           'interest_anchor'],
+                       "product_anchors": anchors[c.item.client_id, c.item.intent][
+                           'product_anchors'],
                        "score": c.item.score} for i, c in enumerate(selected)],
             "client_id": request.client_id,
             "source_segment": viewer.source.segment,
@@ -243,7 +261,11 @@ class Engine:
             raise ValueError("Event timestamp is in the future")
         if event.occurred_at < datetime.fromisoformat(slate["created_at"]):
             raise ValueError("Event predates recommendation request")
-        payload = {"event": event.model_dump(mode="json"), "received_at": utcnow().isoformat(),
+        anchor = (matched.get('product_anchors', {}).get(event.product_id)
+                  if event.product_id and matched['intent'] == Intent.supplier
+                  else matched.get('interest_anchor'))
+        payload = {"interest_anchor": anchor,
+                   "event": event.model_dump(mode="json"), "received_at": utcnow().isoformat(),
                    "intent": matched["intent"], "vector": matched["vector"],
                    "features": matched["features"],
                    "position": matched["position"], "mode": slate["mode"],

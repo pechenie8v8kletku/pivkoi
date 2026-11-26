@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     rerank_tpm: int = Field(default=60000, ge=1000)
     rerank_top_k: int = Field(default=12, ge=1, le=30)
     candidate_limit: int = Field(default=150, ge=10)
+    interest_retrieval_enabled: bool = True
+    interest_max_vectors: int = Field(default=10, ge=1, le=20)
+    interest_candidates_per_vector: int = Field(default=20, ge=10, le=100)
+    interest_half_life_days: float = Field(default=14, gt=0)
+    interest_min_support: float = Field(default=0.2, gt=0, le=1)
+    interest_merge_similarity: float = Field(default=0.9, gt=0, le=1)
     retrieval_client_batch_size: int = Field(default=128, ge=1, le=10000)
     retrieval_document_batch_size: int = Field(default=1024, ge=1, le=50000)
     retrieval_query_batch_size: int = Field(default=64, ge=1, le=1000)
